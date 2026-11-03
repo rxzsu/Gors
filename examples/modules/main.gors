@@ -1,0 +1,12 @@
+import math "math.gors"
+
+fn greeting() -> Option<string> { return Some("hello") }
+
+fn main() {
+    let p: math::Point = math::origin()
+    println(p.norm2())
+    match greeting() {
+        Some(message) => { println(message) },
+        None => { println("no greeting") },
+    }
+}

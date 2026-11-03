@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"gors/internal/compiler"
+	"gors/internal/diagnostic"
+	"gors/internal/version"
 )
 
 type options struct {
@@ -31,6 +33,8 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
+	case "version", "--version", "-V":
+		fmt.Println("GoRs " + version.Version)
 	case "run":
 		os.Exit(runCmd(args, false))
 	case "build":
@@ -53,6 +57,7 @@ usage:
   gors run   <file.gors> [--backend c|go]   compile and run
   gors build <file.gors> [-o out]           compile to a native binary
   gors emit  <file.gors> [--backend c|go]   print generated source
+  gors --version                         print compiler version
 
 backends:
   c   native code via gcc/clang -O2, no runtime, no GC (default when found)
@@ -122,9 +127,9 @@ func emitCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	out, errs := compiler.CompileWith(string(src), o.backend)
+	out, errs := compiler.CompileFile(o.rest[0], o.backend)
 	if len(errs) > 0 {
-		printErrors(o.rest[0], errs)
+		printErrors(o.rest[0], string(src), errs)
 		return 1
 	}
 	fmt.Print(out)
@@ -144,9 +149,9 @@ func runCmd(args []string, build bool) int {
 		return 1
 	}
 
-	out, errs := compiler.CompileWith(string(src), o.backend)
+	out, errs := compiler.CompileFile(path, o.backend)
 	if len(errs) > 0 {
-		printErrors(path, errs)
+		printErrors(path, string(src), errs)
 		return 1
 	}
 
@@ -233,9 +238,9 @@ func compileGo(src, dir, bin string) error {
 	return cmd.Run()
 }
 
-func printErrors(path string, errs []error) {
+func printErrors(path, source string, errs []error) {
 	for _, e := range errs {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", path, e.Error())
+		fmt.Fprint(os.Stderr, diagnostic.Format(path, source, e))
 	}
 }
 

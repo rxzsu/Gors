@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"gors/internal/ast"
 	"gors/internal/sema"
@@ -22,9 +21,19 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 
 	g.line("package main")
 	g.line("")
-	g.line("import \"fmt\"")
+	g.line("import (\"fmt\"; \"os\")")
 	g.line("")
 
+	// Match the C backend's checked-index diagnostic and exit status.
+	g.out.WriteString(`func __gors_index[T any](xs []T, i int64) int64 {
+    if i < 0 || i >= int64(len(xs)) {
+        fmt.Fprintf(os.Stderr, "gors: index %d out of bounds (len %d)\n", i, len(xs))
+        os.Exit(1)
+    }
+    return i
+}
+
+`)
 	for _, sd := range prog.Structs {
 		g.genStruct(sd)
 	}
@@ -47,6 +56,7 @@ type gen struct {
 	info    *sema.Info
 	ind     int
 	tmp     int
+	retType sema.Type
 
 	scopes []map[string]bool // used flags per block
 }
@@ -210,13 +220,16 @@ func (g *gen) genFunc(fn *ast.FuncDecl) {
 		g.line("func %s(%s)%s {", mangle(fn.Name), strings.Join(params, ", "), ret)
 	}
 
+	g.retType = sig.Ret
 	g.ind++
 	g.push()
 	if fn.Recv != nil {
 		g.declare(mangle(fn.Recv.Name))
+		g.use(mangle(fn.Recv.Name))
 	}
 	for _, p := range fn.Params {
 		g.declare(mangle(p.Name))
+		g.use(mangle(p.Name))
 	}
 	for _, s := range fn.Body.Stmts {
 		g.genStmt(s)
@@ -256,14 +269,24 @@ func (g *gen) genStmt(s ast.Stmt) {
 			gt = goType(t)
 		}
 		name := mangle(st.Name)
+		if name == "_" {
+			g.line("_ = %s", g.expr(st.Value))
+			return
+		}
 		g.line("var %s %s = %s", name, gt, g.expr(st.Value))
 		g.declare(name)
+		g.line("_ = %s", name)
+		g.use(name)
 
 	case *ast.AssignStmt:
 		g.line("%s = %s", g.expr(st.Target), g.expr(st.Value))
 
 	case *ast.ExprStmt:
-		g.line("%s", g.expr(st.X))
+		if _, void := g.info.ExprTypes[st.X].(*sema.Void); void {
+			g.line("%s", g.expr(st.X))
+		} else {
+			g.line("_ = %s", g.expr(st.X))
+		}
 
 	case *ast.ReturnStmt:
 		if st.X == nil {
@@ -284,12 +307,15 @@ func (g *gen) genStmt(s ast.Stmt) {
 		g.ind--
 		g.genElse(st.Else)
 
+	case *ast.MatchStmt:
+		g.genMatch(st)
 	case *ast.IfLetStmt:
 		g.genIfLet(st)
 
 	case *ast.WhileStmt:
-		g.line("for %s {", g.expr(st.Cond))
+		g.line("for {")
 		g.ind++
+		g.line("if !(%s) { break }", g.expr(st.Cond))
 		g.push()
 		for _, s := range st.Body.Stmts {
 			g.genStmt(s)
@@ -320,8 +346,11 @@ func (g *gen) genElse(e ast.Stmt) {
 	}
 	switch el := e.(type) {
 	case *ast.IfStmt:
-		g.out.WriteString(strings.Repeat("\t", g.ind) + "} else ")
+		g.line("} else {")
+		g.ind++
 		g.genIfInline(el)
+		g.ind--
+		g.line("}")
 	case *ast.IfLetStmt:
 		// `else if let` needs a nested if statement.
 		g.line("} else {")
@@ -347,7 +376,7 @@ func (g *gen) genElse(e ast.Stmt) {
 }
 
 func (g *gen) genIfInline(st *ast.IfStmt) {
-	g.out.WriteString(fmt.Sprintf("if %s {\n", g.expr(st.Cond)))
+	g.line("if %s {", g.expr(st.Cond))
 	g.ind++
 	g.push()
 	for _, s := range st.Then.Stmts {
@@ -381,8 +410,14 @@ func (g *gen) genIfLet(st *ast.IfLetStmt) {
 	g.line("if %s {", cond)
 	g.ind++
 	g.push()
-	g.line("%s := %s.%s", mangle(st.Name), tmp, field)
-	g.declare(mangle(st.Name))
+	if st.Name == "_" {
+		g.line("_ = %s.%s", tmp, field)
+	} else {
+		g.line("%s := %s.%s", mangle(st.Name), tmp, field)
+		g.declare(mangle(st.Name))
+		g.line("_ = %s", mangle(st.Name))
+		g.use(mangle(st.Name))
+	}
 	for _, s := range st.Then.Stmts {
 		g.genStmt(s)
 	}
@@ -395,6 +430,20 @@ func (g *gen) genIfLet(st *ast.IfLetStmt) {
 // --- expressions ---
 
 func (g *gen) expr(e ast.Expr) string {
+	value := g.rawExpr(e)
+	if _, call := e.(*ast.Call); call {
+		if t := g.info.ExprTypes[e]; t != nil {
+			if _, void := t.(*sema.Void); !void {
+				tmp := g.temp()
+				g.line("var %s %s = %s", tmp, goType(t), value)
+				return tmp
+			}
+		}
+	}
+	return value
+}
+
+func (g *gen) rawExpr(e ast.Expr) string {
 	switch ex := e.(type) {
 	case *ast.IntLit:
 		return strconv.FormatInt(ex.Value, 10)
@@ -423,7 +472,23 @@ func (g *gen) expr(e ast.Expr) string {
 		return "(" + ex.Op + g.expr(ex.X) + ")"
 
 	case *ast.Binary:
-		return "(" + g.expr(ex.X) + " " + ex.Op + " " + g.expr(ex.Y) + ")"
+		left := g.expr(ex.X)
+		if ex.Op == "&&" || ex.Op == "||" {
+			tmp := g.temp()
+			g.line("%s := %s", tmp, left)
+			cond := tmp
+			if ex.Op == "||" {
+				cond = "!" + tmp
+			}
+			g.line("if %s {", cond)
+			g.ind++
+			right := g.expr(ex.Y)
+			g.line("%s = %s", tmp, right)
+			g.ind--
+			g.line("}")
+			return tmp
+		}
+		return "(" + left + " " + ex.Op + " " + g.expr(ex.Y) + ")"
 
 	case *ast.AddrOf:
 		return "&" + g.expr(ex.X)
@@ -435,7 +500,8 @@ func (g *gen) expr(e ast.Expr) string {
 		return g.expr(ex.X) + "." + fieldName(ex.Name)
 
 	case *ast.Index:
-		return g.expr(ex.X) + "[" + g.expr(ex.Idx) + "]"
+		base := g.expr(ex.X)
+		return base + "[__gors_index(" + base + ", " + g.expr(ex.Idx) + ")]"
 
 	case *ast.StructLit:
 		var parts []string
@@ -486,13 +552,10 @@ func (g *gen) call(ex *ast.Call) string {
 			}
 			return "int64(len(" + g.args(ex.Args) + "))"
 		case "push":
-			if len(ex.Args) == 2 {
-				if addr, ok := ex.Args[0].(*ast.AddrOf); ok {
-					target := g.expr(addr.X)
-					return target + " = append(" + target + ", " + g.expr(ex.Args[1]) + ")"
-				}
-			}
-			return "/* push */"
+			ptr := g.temp()
+			g.line("%s := %s", ptr, g.expr(ex.Args[0]))
+			return "*" + ptr + " = append(*" + ptr + ", " + g.expr(ex.Args[1]) + ")"
+
 		}
 	}
 	return g.expr(ex.Fn) + "(" + g.args(ex.Args) + ")"
@@ -521,7 +584,7 @@ func (g *gen) lowerTry(ex *ast.TryExpr) string {
 	tmp := g.temp()
 	g.emitPending("var %s %s = %s", tmp, gt, inner)
 	g.emitPending("if !%s.ok {", tmp)
-	g.emitPendingAt(1, "return %s{err: %s.err}", gt, tmp)
+	g.emitPendingAt(1, "return %s{err: %s.err}", goType(g.retType), tmp)
 	g.emitPending("}")
 	return tmp + ".val"
 }
@@ -606,32 +669,12 @@ func goType(t sema.Type) string {
 
 // --- naming ---
 
-func fieldName(n string) string {
-	if n == "" {
-		return n
-	}
-	r := []rune(n)
-	r[0] = unicode.ToUpper(r[0])
-	return string(r)
-}
-
-var goReserved = map[string]bool{
-	"break": true, "case": true, "chan": true, "const": true, "continue": true,
-	"default": true, "defer": true, "else": true, "fallthrough": true, "for": true,
-	"func": true, "go": true, "goto": true, "if": true, "import": true,
-	"interface": true, "map": true, "package": true, "range": true, "return": true,
-	"select": true, "struct": true, "switch": true, "type": true, "var": true,
-	"fmt": true, "nil": true, "iota": true, "make": true, "new": true,
-	"append": true, "cap": true, "copy": true, "delete": true, "panic": true,
-	"recover": true, "string": true, "int": true, "int64": true, "float64": true,
-	"bool": true, "byte": true, "rune": true, "error": true, "any": true,
-}
-
+func fieldName(name string) string { return "__gors_field_" + name }
 func mangle(name string) string {
-	if goReserved[name] {
-		return name + "_"
+	if name == "main" || name == "_" || name == "" {
+		return name
 	}
-	return name
+	return "__gors_user_" + name
 }
 
 func sortStrings(s []string) {
@@ -640,4 +683,44 @@ func sortStrings(s []string) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
+}
+
+func (g *gen) genMatch(st *ast.MatchStmt) {
+	t := g.info.ExprTypes[st.Value]
+	tmp := g.temp()
+	g.line("var %s %s = %s", tmp, goType(t), g.expr(st.Value))
+	cond := tmp + ".some"
+	if _, ok := t.(*sema.ResultT); ok {
+		cond = tmp + ".ok"
+	}
+	if st.Arms[0].Kind == "None" || st.Arms[0].Kind == "Err" {
+		cond = "!" + cond
+	}
+	g.line("if %s {", cond)
+	for i, arm := range st.Arms {
+		if i > 0 {
+			g.line("} else {")
+		}
+		g.ind++
+		g.push()
+		if g.info.MatchTypes[arm] != nil {
+			field := "val"
+			if arm.Kind == "Err" {
+				field = "err"
+			}
+			name := mangle(arm.Name)
+			if name == "_" {
+				g.line("_ = %s.%s", tmp, field)
+			} else {
+				g.line("%s := %s.%s", name, tmp, field)
+				g.line("_ = %s", name)
+			}
+		}
+		for _, s := range arm.Body.Stmts {
+			g.genStmt(s)
+		}
+		g.pop()
+		g.ind--
+	}
+	g.line("}")
 }

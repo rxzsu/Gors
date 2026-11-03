@@ -250,6 +250,8 @@ type Param struct {
 
 // FuncDecl is a top-level function or a method.
 type FuncDecl struct {
+	Public bool
+
 	Name   string
 	Recv   *Param // non-nil for methods: fn (p: &Point) dist2()
 	Params []Param
@@ -267,13 +269,67 @@ type StructField struct {
 
 // StructDecl is a top-level struct.
 type StructDecl struct {
+	Public bool
+
 	Name   string
 	Fields []StructField
 	At     token.Pos
 }
 
 // Program is a parsed source file.
+type Import struct {
+	Alias, Path string
+	At          token.Pos
+}
+
 type Program struct {
+	Imports []Import
+
 	Structs []*StructDecl
 	Funcs   []*FuncDecl
+}
+
+// MatchStmt exhaustively destructures an Option or Result, evaluating Value once.
+type MatchStmt struct {
+	Value Expr
+	Arms  []*MatchArm
+	At    token.Pos
+}
+type MatchArm struct {
+	Kind, Name string
+	Body       *Block
+	At         token.Pos
+}
+
+func (s *MatchStmt) stmt()          {}
+func (s *MatchStmt) Pos() token.Pos { return s.At }
+
+// Terminates reports whether every path through a statement returns.
+func Terminates(s Stmt) bool {
+	switch st := s.(type) {
+	case *ReturnStmt:
+		return true
+	case *Block:
+		for _, s := range st.Stmts {
+			if Terminates(s) {
+				return true
+			}
+		}
+		return false
+	case *IfStmt:
+		return st.Else != nil && Terminates(st.Then) && Terminates(st.Else)
+	case *IfLetStmt:
+		return st.Else != nil && Terminates(st.Then) && Terminates(st.Else)
+	case *MatchStmt:
+		if len(st.Arms) != 2 {
+			return false
+		}
+		for _, a := range st.Arms {
+			if !Terminates(a.Body) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }

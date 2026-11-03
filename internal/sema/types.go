@@ -72,9 +72,17 @@ var (
 
 // Error is a semantic error.
 type Error struct {
-	Code string
-	Pos  token.Pos
-	Msg  string
+	Code  string
+	Pos   token.Pos
+	Msg   string
+	Notes []Note
+	Hint  string
+}
+
+// Note points to an earlier operation that explains a diagnostic.
+type Note struct {
+	Pos token.Pos
+	Msg string
 }
 
 func (e *Error) Error() string {
@@ -102,6 +110,8 @@ func isMutRef(t Type) bool {
 
 // FuncSig is a function signature.
 type FuncSig struct {
+	Public bool
+	Decl   token.Pos
 	Name   string
 	Params []Type
 	Ret    Type
@@ -116,6 +126,7 @@ type Info struct {
 	// MethodSel marks Field expressions that resolve to a method.
 	MethodSel map[ast.Expr]bool
 	// IfLetTypes holds the type bound by `if let PATTERN = expr`.
+	MatchTypes map[*ast.MatchArm]Type
 	IfLetTypes map[*ast.IfLetStmt]Type
 	// Moves marks expressions that transfer ownership.
 	Moves     map[ast.Expr]bool

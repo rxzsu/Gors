@@ -3,6 +3,8 @@
 package compiler
 
 import (
+	"fmt"
+	"gors/internal/ast"
 	"gors/internal/cgen"
 	"gors/internal/codegen"
 	"gors/internal/parser"
@@ -15,7 +17,7 @@ type Backend string
 const (
 	// BackendGo emits Go source (fast compile, GC runtime).
 	BackendGo Backend = "go"
-	// BackendC emits C11 source (no runtime, native -O2 code).
+	// BackendC emits C23 source (no runtime, native -O2 code).
 	BackendC Backend = "c"
 )
 
@@ -32,6 +34,16 @@ func CompileWith(src string, backend Backend) (string, []error) {
 		return "", wrap(perrs)
 	}
 
+	if len(prog.Imports) > 0 {
+		return "", []error{&parser.Error{Pos: prog.Imports[0].At, Msg: "imports require a file entry point (CompileFile)"}}
+	}
+	return compileProgram(prog, backend)
+}
+
+func compileProgram(prog *ast.Program, backend Backend) (string, []error) {
+	if backend != BackendC && backend != BackendGo {
+		return "", []error{fmt.Errorf("unknown backend %q (expected c or go)", backend)}
+	}
 	info, cerrs := sema.Check(prog)
 	if len(cerrs) > 0 {
 		return "", wrap(cerrs)

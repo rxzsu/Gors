@@ -176,6 +176,11 @@ func (l *Lexer) Tokens() []token.Token {
 			lit := string(c)
 			switch c {
 			case '=':
+				if l.peek(0) == '>' {
+					l.advance()
+					tt, lit = token.FATARROW, "=>"
+					break
+				}
 				if l.peek(0) == '=' {
 					l.advance()
 					tt, lit = token.EQ, "=="
@@ -247,6 +252,11 @@ func (l *Lexer) Tokens() []token.Token {
 			case ',':
 				tt = token.COMMA
 			case ':':
+				if l.peek(0) == ':' {
+					l.advance()
+					tt, lit = token.PATH, "::"
+					break
+				}
 				tt = token.COLON
 			case '.':
 				tt = token.DOT

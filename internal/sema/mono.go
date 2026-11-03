@@ -1,6 +1,9 @@
 package sema
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // MonoTypes returns every distinct Option/Result instantiation used in info.
 // Generic types are monomorphised: Option<int> and Option<string> become two
@@ -85,7 +88,7 @@ func MonoName(t Type) string {
 		}
 		return tt.Name
 	case *StructT:
-		return tt.Name
+		return fmt.Sprintf("User%d_%s", len(tt.Name), tt.Name)
 	case *Ptr:
 		return "ref_" + MonoName(tt.Elem)
 	case *Slice:

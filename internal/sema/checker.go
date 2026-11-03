@@ -15,6 +15,7 @@ func Check(prog *ast.Program) (*Info, []*Error) {
 			Funcs:      map[string]*FuncSig{},
 			Methods:    map[string]map[string]*FuncSig{},
 			MethodSel:  map[ast.Expr]bool{},
+			MatchTypes: map[*ast.MatchArm]Type{},
 			IfLetTypes: map[*ast.IfLetStmt]Type{},
 			Moves:      map[ast.Expr]bool{},
 			ExprTypes:  map[ast.Expr]Type{},
@@ -22,6 +23,10 @@ func Check(prog *ast.Program) (*Info, []*Error) {
 		},
 	}
 	c.declareStructs(prog)
+	c.validateTypes(prog)
+	if len(c.errs) > 0 {
+		return c.info, c.errs
+	}
 	c.declareFuncs(prog)
 	for _, fn := range prog.Funcs {
 		c.checkFunc(fn)
@@ -87,11 +92,15 @@ func (c *checker) declareFuncs(prog *ast.Program) {
 			c.declareMethod(fn)
 			continue
 		}
+		if _, dup := c.info.Structs[fn.Name]; dup {
+			c.errf("E102", fn.At, "function name conflicts with a type")
+			continue
+		}
 		if _, dup := c.info.Funcs[fn.Name]; dup {
 			c.errf("E102", fn.At, "function %q is already declared", fn.Name)
 			continue
 		}
-		sig := &FuncSig{Name: fn.Name, Ret: VoidT}
+		sig := &FuncSig{Name: fn.Name, Ret: VoidT, Public: fn.Public, Decl: fn.At}
 		for _, p := range fn.Params {
 			pt := c.resolveType(p.Type)
 			if pt == nil {
@@ -103,6 +112,12 @@ func (c *checker) declareFuncs(prog *ast.Program) {
 			if rt := c.resolveType(fn.Ret); rt != nil {
 				sig.Ret = rt
 			}
+		}
+		if containsRef(sig.Ret) {
+			c.errf("E211", fn.At, "returning references is not supported in v0.1")
+		}
+		if fn.Name == "main" && (len(sig.Params) != 0 || sig.Ret != VoidT) {
+			c.errf("E117", fn.At, "main must have no parameters and no return type")
 		}
 		c.info.Funcs[fn.Name] = sig
 	}
@@ -133,7 +148,7 @@ func (c *checker) declareMethod(fn *ast.FuncDecl) {
 		c.errf("E142", fn.At, "method %q conflicts with a field of %q", fn.Name, st.Name)
 	}
 
-	sig := &FuncSig{Name: st.Name + "." + fn.Name, Ret: VoidT}
+	sig := &FuncSig{Name: st.Name + "." + fn.Name, Ret: VoidT, Public: fn.Public, Decl: fn.At}
 	sig.Params = append(sig.Params, rt) // receiver is Params[0]
 	for _, p := range fn.Params {
 		pt := c.resolveType(p.Type)
@@ -146,6 +161,9 @@ func (c *checker) declareMethod(fn *ast.FuncDecl) {
 		if r := c.resolveType(fn.Ret); r != nil {
 			sig.Ret = r
 		}
+	}
+	if containsRef(sig.Ret) {
+		c.errf("E211", fn.At, "returning references is not supported in v0.1")
 	}
 	c.info.Methods[st.Name][fn.Name] = sig
 }
@@ -174,6 +192,10 @@ func (c *checker) resolveType(te ast.TypeExpr) Type {
 			if elem == nil {
 				return nil
 			}
+			if containsRef(elem) {
+				c.errf("E211", t.At, "references cannot be stored in Option")
+				return nil
+			}
 			return &OptionT{Elem: elem}
 		case "Result":
 			if len(t.Args) != 2 {
@@ -183,6 +205,10 @@ func (c *checker) resolveType(te ast.TypeExpr) Type {
 			ok := c.resolveType(t.Args[0])
 			bad := c.resolveType(t.Args[1])
 			if ok == nil || bad == nil {
+				return nil
+			}
+			if containsRef(ok) || containsRef(bad) {
+				c.errf("E211", t.At, "references cannot be stored in Result")
 				return nil
 			}
 			return &ResultT{Ok: ok, Err: bad}
@@ -201,10 +227,18 @@ func (c *checker) resolveType(te ast.TypeExpr) Type {
 		if elem == nil {
 			return nil
 		}
+		if containsRef(elem) {
+			c.errf("E211", t.At, "nested references are not supported")
+			return nil
+		}
 		return &Ptr{Elem: elem, Mut: t.Mut}
 	case *ast.SliceType:
 		elem := c.resolveType(t.Elem)
 		if elem == nil {
+			return nil
+		}
+		if containsRef(elem) {
+			c.errf("E211", t.At, "references cannot be stored in slices")
 			return nil
 		}
 		return &Slice{Elem: elem}
@@ -219,9 +253,14 @@ func (c *checker) pushScope() { c.scopes = append(c.scopes, map[string]*varInfo{
 func (c *checker) popScope() { c.scopes = c.scopes[:len(c.scopes)-1] }
 
 func (c *checker) declare(name string, v *varInfo) bool {
+	if name == "_" {
+		return true
+	}
 	scope := c.scopes[len(c.scopes)-1]
-	if _, dup := scope[name]; dup {
-		return false
+	for _, s := range c.scopes {
+		if _, dup := s[name]; dup {
+			return false
+		}
 	}
 	scope[name] = v
 	return true
@@ -275,14 +314,15 @@ func (c *checker) checkFunc(fn *ast.FuncDecl) {
 		}
 	}
 	c.checkBlock(fn.Body)
+	if sig.Ret != VoidT && !ast.Terminates(fn.Body) {
+		c.errf("E118", fn.At, "not all paths return a value")
+	}
 	c.popScope()
 }
 
 func (c *checker) checkBlock(b *ast.Block) {
 	c.pushScope()
-	for _, s := range b.Stmts {
-		c.checkStmt(s)
-	}
+	c.checkStatements(b.Stmts)
 	c.popScope()
 }
 
@@ -307,6 +347,10 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			c.declare(st.Name, &varInfo{Type: Int, Mut: st.Mut})
 			return
 		}
+		if nestedRef(vt) {
+			c.errf("E211", st.At, "references cannot be stored in aggregates or borrowed through another reference")
+			return
+		}
 		if _, isVoid := vt.(*Void); isVoid {
 			c.errf("E105", st.At, "let binding requires a value, got void expression")
 			return
@@ -329,6 +373,9 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		tt := c.checkExpr(st.Target)
 		if tt == nil {
 			return
+		}
+		if _, ref := tt.(*Ptr); ref {
+			c.errf("E210", st.At, "reference bindings cannot be reassigned in v0.1")
 		}
 		vt := c.checkExprExpected(st.Value, tt)
 		if tt == nil || vt == nil {
@@ -420,6 +467,49 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			c.checkStmt(st.Else)
 		}
 
+	case *ast.MatchStmt:
+		vt := c.checkExpr(st.Value)
+		if vt == nil {
+			return
+		}
+		variants := map[string]Type{}
+		switch t := vt.(type) {
+		case *OptionT:
+			variants["Some"] = t.Elem
+			variants["None"] = nil
+		case *ResultT:
+			variants["Ok"] = t.Ok
+			variants["Err"] = t.Err
+		default:
+			c.errf("E170", st.At, "match requires Option or Result, got %s", vt.String())
+			return
+		}
+		seen := map[string]bool{}
+		for _, arm := range st.Arms {
+			bound, ok := variants[arm.Kind]
+			if !ok {
+				c.errf("E171", arm.At, "pattern %s does not belong to %s", arm.Kind, vt.String())
+				continue
+			}
+			if seen[arm.Kind] {
+				c.errf("E172", arm.At, "duplicate match arm %s", arm.Kind)
+			}
+			seen[arm.Kind] = true
+			if (bound == nil) != (arm.Name == "") {
+				c.errf("E173", arm.At, "pattern %s has an invalid binding", arm.Kind)
+				continue
+			}
+			c.info.MatchTypes[arm] = bound
+			if bound == nil {
+				c.checkBlock(arm.Body)
+			} else {
+				c.checkBlockWith(arm.Body, arm.Name, bound)
+			}
+		}
+		if len(seen) != 2 {
+			c.errf("E174", st.At, "non-exhaustive match: cover both variants of %s", vt.String())
+		}
+
 	case *ast.Block:
 		c.checkBlock(st)
 	}
@@ -428,9 +518,7 @@ func (c *checker) checkStmt(s ast.Stmt) {
 func (c *checker) checkBlockWith(b *ast.Block, name string, t Type) {
 	c.pushScope()
 	c.declare(name, &varInfo{Type: t, Mut: false})
-	for _, s := range b.Stmts {
-		c.checkStmt(s)
-	}
+	c.checkStatements(b.Stmts)
 	c.popScope()
 }
 
@@ -487,6 +575,10 @@ func (c *checker) checkExprExpected(e ast.Expr, expected Type) Type {
 
 func (c *checker) checkExpr(e ast.Expr) Type {
 	t := c.expr(e)
+	if nestedRef(t) {
+		c.errf("E211", e.Pos(), "references cannot be stored in aggregates or nested references")
+		return nil
+	}
 	if t != nil {
 		c.info.ExprTypes[e] = t
 	}
@@ -505,6 +597,10 @@ func (c *checker) expr(e ast.Expr) Type {
 		return Bool
 
 	case *ast.Ident:
+		if ex.Name == "_" {
+			c.errf("E121", ex.At, "discard binding _ cannot be read")
+			return nil
+		}
 		if v, ok := c.lookup(ex.Name); ok {
 			return v.Type
 		}
@@ -837,6 +933,10 @@ func (c *checker) checkCall(ex *ast.Call) Type {
 		c.errf("E135", ex.Fn.Pos(), "only named functions can be called")
 		return nil
 	}
+	if fnIdent.Name == "main" {
+		c.errf("E119", ex.At, "entry function main cannot be called")
+		return nil
+	}
 	sig, ok := c.info.Funcs[fnIdent.Name]
 	if !ok {
 		c.errf("E136", ex.At, "undefined function %q", fnIdent.Name)
@@ -882,6 +982,10 @@ func (c *checker) resolveMethod(field *ast.Field) (*FuncSig, *StructT) {
 	}
 	sig, ok := methods[field.Name]
 	if !ok {
+		return nil, nil
+	}
+	if !sig.Public && sig.Decl.File != field.At.File {
+		c.errf("E307", field.At, "method %q is private to its module", field.Name)
 		return nil, nil
 	}
 	return sig, st
@@ -947,4 +1051,16 @@ func sameType(a, b Type) bool {
 
 func assignable(dst, src Type) bool {
 	return sameType(dst, src)
+}
+
+func (c *checker) checkStatements(stmts []ast.Stmt) {
+	terminated := false
+	for _, s := range stmts {
+		if terminated {
+			c.errf("E120", s.Pos(), "unreachable statement after return")
+			return
+		}
+		c.checkStmt(s)
+		terminated = ast.Terminates(s)
+	}
 }

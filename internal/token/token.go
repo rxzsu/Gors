@@ -5,12 +5,17 @@ package token
 type Type string
 
 const (
-	ILLEGAL Type = "ILLEGAL"
-	EOF     Type = "EOF"
-	IDENT   Type = "IDENT"
-	INT     Type = "INT"
-	FLOAT   Type = "FLOAT"
-	STRING  Type = "STRING"
+	IMPORT   Type = "import"
+	PUB      Type = "pub"
+	MATCH    Type = "match"
+	FATARROW Type = "=>"
+	PATH     Type = "::"
+	ILLEGAL  Type = "ILLEGAL"
+	EOF      Type = "EOF"
+	IDENT    Type = "IDENT"
+	INT      Type = "INT"
+	FLOAT    Type = "FLOAT"
+	STRING   Type = "STRING"
 
 	ASSIGN  Type = "="
 	PLUS    Type = "+"
@@ -58,6 +63,7 @@ const (
 
 // Pos is a source position (1-based line and column).
 type Pos struct {
+	File string
 	Line int
 	Col  int
 }
@@ -70,6 +76,7 @@ type Token struct {
 }
 
 var keywords = map[string]Type{
+	"import": IMPORT, "pub": PUB, "match": MATCH,
 	"fn":     FN,
 	"let":    LET,
 	"mut":    MUT,

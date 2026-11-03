@@ -24,9 +24,10 @@ func CheckBorrow(prog *ast.Program, info *Info) []*Error {
 }
 
 type varState struct {
-	typ   Type
-	mut   bool
-	moved bool
+	typ     Type
+	mut     bool
+	moved   bool
+	movedAt token.Pos
 }
 
 type loan struct {
@@ -34,6 +35,7 @@ type loan struct {
 	mutable  bool
 	borrower string
 	end      int
+	pos      token.Pos
 }
 
 type borrowChecker struct {
@@ -45,18 +47,44 @@ type borrowChecker struct {
 	seqOf   map[ast.Expr]int
 	lastUse map[string]int
 
-	curSeq int
-	maxSeq int
+	curSeq     int
+	maxSeq     int
+	callEnd    int
+	endOf      map[ast.Expr]int
+	loopEnd    map[*ast.WhileStmt]int
+	loopOwners []map[*varState]bool
 }
 
 func (b *borrowChecker) errf(code string, pos token.Pos, format string, args ...any) {
-	b.errs = append(b.errs, &Error{Code: code, Pos: pos, Msg: fmt.Sprintf(format, args...)})
+	e := &Error{Code: code, Pos: pos, Msg: fmt.Sprintf(format, args...)}
+	if len(args) > 0 {
+		if name, ok := args[0].(string); ok {
+			if code == "E200" {
+				if st := b.lookup(name); st != nil && st.movedAt.Line > 0 {
+					e.Notes = append(e.Notes, Note{st.movedAt, "value moved here"})
+				}
+				e.Hint = "Borrow the value with & instead of transferring ownership, or create a new value."
+			} else if code == "E202" || code == "E203" || code == "E204" || code == "E205" || code == "E206" {
+				if l := b.activeLoan(name, code == "E202" || code == "E205"); l != nil {
+					e.Notes = append(e.Notes, Note{l.pos, "borrow starts here"})
+				}
+				e.Hint = "Finish using the existing reference before this operation."
+			} else if code == "E207" {
+				e.Hint = "Declare the binding with let mut if it needs to change."
+			}
+		}
+	}
+	b.errs = append(b.errs, e)
 }
 
 // --- numbering pass ---
 
 func (b *borrowChecker) numberFunc(fn *ast.FuncDecl) {
 	b.seqOf = map[ast.Expr]int{}
+	b.endOf = map[ast.Expr]int{}
+	b.loopEnd = map[*ast.WhileStmt]int{}
+	b.callEnd = 0
+	b.loopOwners = nil
 	b.lastUse = map[string]int{}
 	b.curSeq = 0
 	b.numberBlock(fn.Body)
@@ -97,6 +125,13 @@ func (b *borrowChecker) numberStmt(s ast.Stmt) {
 	case *ast.WhileStmt:
 		b.numberExpr(st.Cond)
 		b.numberBlock(st.Body)
+		b.loopEnd[st] = b.curSeq
+	case *ast.MatchStmt:
+		b.numberExpr(st.Value)
+		for _, arm := range st.Arms {
+			b.numberBlock(arm.Body)
+		}
+
 	case *ast.Block:
 		b.numberBlock(st)
 	}
@@ -106,6 +141,7 @@ func (b *borrowChecker) numberExpr(e ast.Expr) {
 	if e == nil {
 		return
 	}
+	defer func() { b.endOf[e] = b.curSeq }()
 	b.curSeq++
 	b.seqOf[e] = b.curSeq
 
@@ -118,6 +154,9 @@ func (b *borrowChecker) numberExpr(e ast.Expr) {
 		b.numberExpr(ex.X)
 		b.numberExpr(ex.Y)
 	case *ast.Call:
+		if _, method := ex.Fn.(*ast.Field); method {
+			b.numberExpr(ex.Fn)
+		}
 		for _, a := range ex.Args {
 			b.numberExpr(a)
 		}
@@ -144,8 +183,21 @@ func (b *borrowChecker) numberExpr(e ast.Expr) {
 // --- checking pass ---
 
 func (b *borrowChecker) checkFunc(fn *ast.FuncDecl) {
-	sig, ok := b.info.Funcs[fn.Name]
-	if !ok {
+	var sig *FuncSig
+	offset := 0
+	if fn.Recv != nil {
+		receiver := fn.Recv.Type
+		if ptr, ok := receiver.(*ast.PtrType); ok {
+			receiver = ptr.Elem
+		}
+		if named, ok := receiver.(*ast.NamedType); ok {
+			sig = b.info.Methods[named.Name][fn.Name]
+		}
+		offset = 1
+	} else {
+		sig = b.info.Funcs[fn.Name]
+	}
+	if sig == nil {
 		return
 	}
 	b.numberFunc(fn)
@@ -153,8 +205,11 @@ func (b *borrowChecker) checkFunc(fn *ast.FuncDecl) {
 	b.scopes = nil
 	b.loans = nil
 	b.pushScope()
+	if fn.Recv != nil {
+		b.declare(fn.Recv.Name, &varState{typ: sig.Params[0]})
+	}
 	for i, p := range fn.Params {
-		b.declare(p.Name, &varState{typ: sig.Params[i], mut: false})
+		b.declare(p.Name, &varState{typ: sig.Params[i+offset], mut: false})
 	}
 	b.checkBlock(fn.Body)
 	b.popScope()
@@ -240,6 +295,24 @@ func (b *borrowChecker) checkStmt(s ast.Stmt) {
 		} else {
 			b.at(st.Value)
 			b.checkExpr(st.Value, !IsCopy(vt))
+			if ptr, ok := vt.(*Ptr); ok {
+				if id, ok := st.Value.(*ast.Ident); ok {
+					if ptr.Mut {
+						b.errf("E209", st.At, "mutable reference %q cannot be copied", id.Name)
+					} else {
+						var aliases []*loan
+						for _, l := range b.loans {
+							if l.borrower == id.Name {
+								copy := *l
+								copy.borrower = st.Name
+								copy.end = b.lastUse[st.Name]
+								aliases = append(aliases, &copy)
+							}
+						}
+						b.loans = append(b.loans, aliases...)
+					}
+				}
+			}
 		}
 		b.declare(st.Name, &varState{typ: vt, mut: st.Mut})
 
@@ -261,7 +334,11 @@ func (b *borrowChecker) checkStmt(s ast.Stmt) {
 			}
 			v.moved = false
 		}
+		b.checkExpr(st.Target, false)
 		b.checkExpr(st.Value, true)
+		if v := b.lookup(root); v != nil {
+			v.moved = false
+		}
 
 	case *ast.ExprStmt:
 		b.at(st.X)
@@ -288,17 +365,32 @@ func (b *borrowChecker) checkStmt(s ast.Stmt) {
 		elseMoved, elseLoans := b.snapshot()
 
 		// Merge: a value is moved if it is moved on any path.
-		merged := map[string]bool{}
+		merged := map[string]moveState{}
 		for k, v := range thenMoved {
 			merged[k] = v
 		}
 		for k, v := range elseMoved {
-			merged[k] = merged[k] || v
+			if v.moved {
+				merged[k] = v
+			}
 		}
 		b.restore(merged, nil)
 		b.loans = mergeLoans(thenLoans, elseLoans)
 
 	case *ast.WhileStmt:
+		owners := map[*varState]bool{}
+		for _, sc := range b.scopes {
+			for _, v := range sc {
+				owners[v] = true
+			}
+		}
+		b.loopOwners = append(b.loopOwners, owners)
+		defer func() { b.loopOwners = b.loopOwners[:len(b.loopOwners)-1] }()
+		for _, l := range b.loans {
+			if l.end >= b.seqOf[st.Cond] && l.end < b.loopEnd[st] {
+				l.end = b.loopEnd[st]
+			}
+		}
 		b.at(st.Cond)
 		b.checkExpr(st.Cond, false)
 		beforeMoved, beforeLoans := b.snapshot()
@@ -306,23 +398,58 @@ func (b *borrowChecker) checkStmt(s ast.Stmt) {
 		bodyMoved, _ := b.snapshot()
 		// The body may run zero times or many times: keep the union of
 		// pre-loop loans and pre-loop moved flags.
-		merged := map[string]bool{}
+		merged := map[string]moveState{}
 		for k, v := range beforeMoved {
 			merged[k] = v
 		}
 		for k, v := range bodyMoved {
-			merged[k] = merged[k] || v
+			if v.moved {
+				merged[k] = v
+			}
 		}
 		b.restore(merged, beforeLoans)
 
 	case *ast.IfLetStmt:
 		b.at(st.Value)
 		b.checkExpr(st.Value, true)
+		before, loans := b.snapshot()
 		bound := b.info.IfLetTypes[st]
 		b.checkBlockWithName(st.Then, st.Name, bound)
+		then, thenLoans := b.snapshot()
+		b.restore(before, loans)
 		if st.Else != nil {
 			b.checkStmt(st.Else)
 		}
+		other, otherLoans := b.snapshot()
+		for name, state := range then {
+			if state.moved {
+				other[name] = state
+			}
+		}
+		b.restore(other, mergeLoans(thenLoans, otherLoans))
+
+	case *ast.MatchStmt:
+		b.at(st.Value)
+		b.checkExpr(st.Value, true)
+		before, loans := b.snapshot()
+		merged := map[string]moveState{}
+		var mergedLoans []*loan
+		for _, arm := range st.Arms {
+			b.restore(before, loans)
+			if bound := b.info.MatchTypes[arm]; bound != nil {
+				b.checkBlockWithName(arm.Body, arm.Name, bound)
+			} else {
+				b.checkBlock(arm.Body)
+			}
+			moved, ls := b.snapshot()
+			for name, state := range moved {
+				if old, ok := merged[name]; !ok || !old.moved {
+					merged[name] = state
+				}
+			}
+			mergedLoans = mergeLoans(mergedLoans, ls)
+		}
+		b.restore(merged, mergedLoans)
 
 	case *ast.Block:
 		b.checkBlock(st)
@@ -350,11 +477,16 @@ func (b *borrowChecker) checkBlockWithName(blk *ast.Block, name string, t Type) 
 	b.popScope()
 }
 
-func (b *borrowChecker) snapshot() (map[string]bool, []*loan) {
-	moved := map[string]bool{}
+type moveState struct {
+	moved bool
+	pos   token.Pos
+}
+
+func (b *borrowChecker) snapshot() (map[string]moveState, []*loan) {
+	moved := map[string]moveState{}
 	for _, sc := range b.scopes {
 		for name, st := range sc {
-			moved[name] = st.moved
+			moved[name] = moveState{st.moved, st.movedAt}
 		}
 	}
 	loans := make([]*loan, len(b.loans))
@@ -362,11 +494,12 @@ func (b *borrowChecker) snapshot() (map[string]bool, []*loan) {
 	return moved, loans
 }
 
-func (b *borrowChecker) restore(moved map[string]bool, loans []*loan) {
+func (b *borrowChecker) restore(moved map[string]moveState, loans []*loan) {
 	for _, sc := range b.scopes {
 		for name, st := range sc {
 			if m, ok := moved[name]; ok {
-				st.moved = m
+				st.moved = m.moved
+				st.movedAt = m.pos
 			}
 		}
 	}
@@ -419,8 +552,15 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 		b.checkExpr(ex.X, false)
 
 	case *ast.Binary:
+		saved := b.callEnd
+		b.callEnd = b.endOf[ex]
 		b.checkExpr(ex.X, false)
+		b.borrowRead(ex.X)
 		b.checkExpr(ex.Y, false)
+		b.borrowRead(ex.Y)
+		b.curSeq = b.endOf[ex] + 1
+		b.prune()
+		b.callEnd = saved
 
 	case *ast.Field:
 		b.checkExpr(ex.X, false)
@@ -434,6 +574,12 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 	case *ast.Index:
 		b.checkExpr(ex.X, false)
 		b.checkExpr(ex.Idx, false)
+		if moveCtx && !IsCopy(b.typeOf(ex)) {
+			if root, ok := rootIdent(ex.X); ok {
+				b.moveOut(root, ex.At)
+			}
+			b.info.Moves[ex] = true
+		}
 
 	case *ast.StructLit:
 		for _, fi := range ex.Fields {
@@ -458,6 +604,18 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 }
 
 func (b *borrowChecker) checkCall(c *ast.Call) {
+	// A reference argument remains borrowed throughout the whole call, even
+	// when its final textual occurrence is the first argument.
+	for _, a := range c.Args {
+		b.holdReference(a, b.endOf[c])
+	}
+	if field, ok := c.Fn.(*ast.Field); ok {
+		b.holdReference(field.X, b.endOf[c])
+	}
+
+	before := b.callEnd
+	b.callEnd = b.endOf[c]
+	defer func() { b.curSeq = b.endOf[c] + 1; b.prune(); b.callEnd = before }()
 	if id, ok := c.Fn.(*ast.Ident); ok {
 		switch id.Name {
 		case "Some", "Ok", "Err":
@@ -472,6 +630,7 @@ func (b *borrowChecker) checkCall(c *ast.Call) {
 					b.borrowPlace(addr.X, true, addr.At, "")
 				} else {
 					b.checkExpr(c.Args[0], false)
+					b.borrowPlace(c.Args[0], true, c.Args[0].Pos(), "")
 				}
 				b.checkExpr(c.Args[1], true)
 			}
@@ -487,6 +646,7 @@ func (b *borrowChecker) checkCall(c *ast.Call) {
 		case "println", "print", "len":
 			for _, a := range c.Args {
 				b.checkExpr(a, false)
+				b.borrowRead(a)
 			}
 			return
 		}
@@ -499,7 +659,7 @@ func (b *borrowChecker) checkCall(c *ast.Call) {
 				b.checkExpr(a, false)
 				continue
 			}
-			b.checkExpr(a, !IsCopy(sig.Params[i]))
+			b.checkArgument(a, sig.Params[i])
 		}
 		return
 	}
@@ -521,15 +681,14 @@ func (b *borrowChecker) checkMethodCall(c *ast.Call, field *ast.Field) {
 	}
 	recvType := sig.Params[0]
 	if p, isPtr := recvType.(*Ptr); isPtr {
+		b.checkExpr(field.X, false)
 		b.borrowPlace(field.X, p.Mut, field.X.Pos(), "")
-	} else if !IsCopy(recvType) {
-		if root, ok := rootIdent(field.X); ok {
-			b.moveOut(root, field.X.Pos())
-		}
+	} else {
+		b.checkExpr(field.X, !IsCopy(recvType))
 	}
 	for i, a := range c.Args {
 		if i+1 < len(sig.Params) {
-			b.checkExpr(a, !IsCopy(sig.Params[i+1]))
+			b.checkArgument(a, sig.Params[i+1])
 		} else {
 			b.checkExpr(a, false)
 		}
@@ -585,6 +744,10 @@ func (b *borrowChecker) moveOut(name string, pos token.Pos) {
 	if st == nil {
 		return
 	}
+	if _, borrowed := st.typ.(*Ptr); borrowed {
+		b.errf("E208", pos, "cannot move out of borrowed value %q", name)
+		return
+	}
 	if st.moved {
 		b.errf("E200", pos, "use of moved value %q", name)
 		return
@@ -593,7 +756,14 @@ func (b *borrowChecker) moveOut(name string, pos token.Pos) {
 		b.errf("E203", pos, "cannot move %q while it is borrowed", name)
 		return
 	}
+	for _, owners := range b.loopOwners {
+		if owners[st] {
+			b.errf("E212", pos, "cannot move %q declared outside a repeating loop", name)
+			return
+		}
+	}
 	st.moved = true
+	st.movedAt = pos
 }
 
 func (b *borrowChecker) newBorrow(addr *ast.AddrOf, borrower string) {
@@ -615,6 +785,10 @@ func (b *borrowChecker) borrowPlace(e ast.Expr, mut bool, pos token.Pos, borrowe
 		b.errf("E200", pos, "cannot borrow moved value %q", root)
 		return
 	}
+	if mut && !st.mut && !isMutRef(st.typ) {
+		b.errf("E124", pos, "cannot borrow immutable %q as mutable", root)
+		return
+	}
 	if mut {
 		if l := b.activeLoan(root, false); l != nil {
 			b.errf("E204", pos, "cannot borrow %q as mutable: it is already borrowed", root)
@@ -628,11 +802,51 @@ func (b *borrowChecker) borrowPlace(e ast.Expr, mut bool, pos token.Pos, borrowe
 	}
 
 	end := b.curSeq
+	if b.callEnd > end {
+		end = b.callEnd
+	}
 	if borrower != "" {
 		end = b.maxSeq
 		if u, ok := b.lastUse[borrower]; ok && u > 0 {
 			end = u
 		}
 	}
-	b.loans = append(b.loans, &loan{root: root, mutable: mut, borrower: borrower, end: end})
+	b.loans = append(b.loans, &loan{root: root, mutable: mut, borrower: borrower, end: end, pos: pos})
+}
+
+func (b *borrowChecker) checkArgument(a ast.Expr, t Type) {
+	b.checkExpr(a, !IsCopy(t))
+	if p, ref := t.(*Ptr); ref {
+		if _, addr := a.(*ast.AddrOf); !addr {
+			b.borrowPlace(a, p.Mut, a.Pos(), "")
+		}
+	}
+}
+
+// Builtins and string operations borrow owning places until they finish; a
+// later operand must not free a string that an earlier operand still reads.
+func (b *borrowChecker) borrowRead(e ast.Expr) {
+	b.holdReference(e, b.callEnd)
+	if t := b.typeOf(e); t != nil && !IsCopy(t) {
+		b.borrowPlace(e, false, e.Pos(), "")
+	}
+}
+
+func (b *borrowChecker) holdReference(e ast.Expr, end int) {
+	root, ok := rootIdent(e)
+	if !ok {
+		return
+	}
+	st := b.lookup(root)
+	if st == nil {
+		return
+	}
+	if _, ref := st.typ.(*Ptr); !ref {
+		return
+	}
+	for _, l := range b.loans {
+		if l.borrower == root && l.end < end {
+			l.end = end
+		}
+	}
 }

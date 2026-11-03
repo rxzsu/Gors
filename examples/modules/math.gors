@@ -1,0 +1,4 @@
+pub struct Point { x: int, y: int }
+fn square(n: int) -> int { return n * n }
+pub fn (p: &Point) norm2() -> int { return square(p.x) + square(p.y) }
+pub fn origin() -> Point { return Point { x: 3, y: 4 } }

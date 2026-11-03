@@ -2,3 +2,6 @@ gors.exe
 *.exe
 *.o
 .workbuddy-ai/
+
+dist/
+/gors

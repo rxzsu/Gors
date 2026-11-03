@@ -4,6 +4,7 @@ package parser
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"gors/internal/ast"
 	"gors/internal/lexer"
@@ -32,8 +33,26 @@ type Parser struct {
 // Parse parses source code. It always returns a (possibly partial) program
 // together with all collected errors.
 func Parse(src string) (*ast.Program, []*Error) {
+	return ParseFile(src, "")
+}
+
+func ParseFile(src, file string) (*ast.Program, []*Error) {
 	toks := lexer.New(src).Tokens()
+	for i := range toks {
+		toks[i].Pos.File = file
+	}
 	p := &Parser{toks: toks}
+	for _, t := range toks {
+		reserved := strings.HasPrefix(t.Lit, "__gors_")
+		if strings.HasPrefix(t.Lit, "_t") {
+			if _, err := strconv.Atoi(strings.TrimPrefix(t.Lit, "_t")); err == nil {
+				reserved = true
+			}
+		}
+		if t.Type == token.IDENT && reserved {
+			p.errorf(t.Pos, "identifier %q is reserved by the compiler", t.Lit)
+		}
+	}
 	prog := p.parseProgram()
 	return prog, p.errs
 }
@@ -88,13 +107,25 @@ func (p *Parser) sync() {
 func (p *Parser) parseProgram() *ast.Program {
 	prog := &ast.Program{}
 	for !p.check(token.EOF) {
+		before := p.pos
+		public := p.accept(token.PUB)
 		switch p.cur().Type {
+		case token.IMPORT:
+			start := p.advance()
+			alias := p.expect(token.IDENT)
+			path := p.expect(token.STRING)
+			prog.Imports = append(prog.Imports, ast.Import{Alias: alias.Lit, Path: path.Lit, At: start.Pos})
+			if public {
+				p.errorf(start.Pos, "an import cannot be public")
+			}
 		case token.STRUCT:
 			if d := p.parseStructDecl(); d != nil {
+				d.Public = public
 				prog.Structs = append(prog.Structs, d)
 			}
 		case token.FN:
 			if d := p.parseFuncDecl(); d != nil {
+				d.Public = public
 				prog.Funcs = append(prog.Funcs, d)
 			}
 		case token.SEMI:
@@ -102,6 +133,9 @@ func (p *Parser) parseProgram() *ast.Program {
 		default:
 			p.errorf(p.cur().Pos, "unexpected token %q at top level", p.cur().Type)
 			p.sync()
+		}
+		if p.pos == before {
+			p.advance()
 		}
 	}
 	return prog
@@ -111,6 +145,9 @@ func (p *Parser) parseStructDecl() *ast.StructDecl {
 	start := p.expect(token.STRUCT)
 	name := p.expect(token.IDENT)
 	p.expect(token.LBRACE)
+	if reservedGlobal(name.Lit) {
+		p.errorf(name.Pos, "reserved declaration name %q", name.Lit)
+	}
 	decl := &ast.StructDecl{Name: name.Lit, At: start.Pos}
 	for !p.check(token.RBRACE) && !p.check(token.EOF) {
 		fname := p.expect(token.IDENT)
@@ -141,6 +178,9 @@ func (p *Parser) parseFuncDecl() *ast.FuncDecl {
 
 	name := p.expect(token.IDENT)
 	p.expect(token.LPAREN)
+	if name.Lit == "_" || (decl.Recv == nil && reservedGlobal(name.Lit)) {
+		p.errorf(name.Pos, "reserved declaration name %q", name.Lit)
+	}
 	decl.Name = name.Lit
 	for !p.check(token.RPAREN) && !p.check(token.EOF) {
 		pname := p.expect(token.IDENT)
@@ -172,7 +212,11 @@ func (p *Parser) parseType() ast.TypeExpr {
 		return &ast.SliceType{Elem: elem, At: t.Pos}
 	case p.check(token.IDENT):
 		p.advance()
-		nt := &ast.NamedType{Name: t.Lit, At: t.Pos}
+		name := t.Lit
+		if p.accept(token.PATH) {
+			name += "::" + p.expect(token.IDENT).Lit
+		}
+		nt := &ast.NamedType{Name: name, At: t.Pos}
 		if p.check(token.LT) {
 			p.advance()
 			for {
@@ -198,7 +242,11 @@ func (p *Parser) parseBlock() *ast.Block {
 		if p.accept(token.SEMI) {
 			continue
 		}
+		before := p.pos
 		s := p.parseStmt()
+		if p.pos == before {
+			p.advance()
+		}
 		if s != nil {
 			b.Stmts = append(b.Stmts, s)
 		}
@@ -209,6 +257,8 @@ func (p *Parser) parseBlock() *ast.Block {
 
 func (p *Parser) parseStmt() ast.Stmt {
 	switch p.cur().Type {
+	case token.MATCH:
+		return p.parseMatch()
 	case token.LET:
 		return p.parseLet()
 	case token.IF:
@@ -442,6 +492,9 @@ func (p *Parser) parsePrimary() ast.Expr {
 		return &ast.BoolLit{Value: false, At: t.Pos}
 	case token.IDENT:
 		p.advance()
+		if p.accept(token.PATH) {
+			t.Lit += "::" + p.expect(token.IDENT).Lit
+		}
 		if p.noStructLit == 0 && p.check(token.LBRACE) {
 			return p.parseStructLit(t)
 		}
@@ -483,4 +536,39 @@ func (p *Parser) parseStructLit(name token.Token) ast.Expr {
 	}
 	p.expect(token.RBRACE)
 	return lit
+}
+
+func (p *Parser) parseMatch() ast.Stmt {
+	start := p.expect(token.MATCH)
+	p.noStructLit++
+	value := p.parseExpr()
+	p.noStructLit--
+	st := &ast.MatchStmt{Value: value, At: start.Pos}
+	p.expect(token.LBRACE)
+	for !p.check(token.RBRACE) && !p.check(token.EOF) {
+		before := p.pos
+		kind := p.expect(token.IDENT)
+		arm := &ast.MatchArm{Kind: kind.Lit, At: kind.Pos}
+		if p.accept(token.LPAREN) {
+			arm.Name = p.expect(token.IDENT).Lit
+			p.expect(token.RPAREN)
+		}
+		p.expect(token.FATARROW)
+		arm.Body = p.parseBlock()
+		st.Arms = append(st.Arms, arm)
+		p.accept(token.COMMA)
+		if before == p.pos {
+			p.advance()
+		}
+	}
+	p.expect(token.RBRACE)
+	return st
+}
+
+func reservedGlobal(name string) bool {
+	switch name {
+	case "_", "int", "float", "string", "bool", "Option", "Result", "Some", "None", "Ok", "Err", "print", "println", "len", "push":
+		return true
+	}
+	return false
 }
