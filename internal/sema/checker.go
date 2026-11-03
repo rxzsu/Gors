@@ -16,6 +16,7 @@ func Check(prog *ast.Program) (*Info, []*Error) {
 			Methods:    map[string]map[string]*FuncSig{},
 			MethodSel:  map[ast.Expr]bool{},
 			IfLetTypes: map[*ast.IfLetStmt]Type{},
+			Moves:      map[ast.Expr]bool{},
 			ExprTypes:  map[ast.Expr]Type{},
 			LetTypes:   map[*ast.LetStmt]Type{},
 		},

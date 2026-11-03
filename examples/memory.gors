@@ -1,0 +1,54 @@
+struct User {
+    name: string,
+    tags: []string,
+}
+
+fn (u: &User) label() -> string {
+    return u.name + " (user)"
+}
+
+fn makeUser(name: string) -> User {
+    let tags = ["active", "new"]
+    return User { name: name, tags: tags }
+}
+
+fn find(x: int) -> Option<string> {
+    if x > 0 {
+        return Some("positive")
+    }
+    return None
+}
+
+fn parse(s: string) -> Result<string, string> {
+    if s == "" {
+        return Err("empty")
+    }
+    return Ok(s + "!")
+}
+
+fn chain(s: string) -> Result<string, string> {
+    let v = parse(s)?
+    return Ok(v + "?")
+}
+
+fn main() {
+    let mut i = 0
+    let mut total = 0
+    while i < 2000 {
+        let u = makeUser("nsvl")
+        let l = u.label()
+        total = total + len(l)
+
+        let o = find(i)
+        if let Some(s) = o {
+            total = total + len(s)
+        }
+
+        let r = chain("x")
+        if let Ok(v) = r {
+            total = total + len(v)
+        }
+        i = i + 1
+    }
+    println(total)
+}

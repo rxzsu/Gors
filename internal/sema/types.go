@@ -117,6 +117,8 @@ type Info struct {
 	MethodSel map[ast.Expr]bool
 	// IfLetTypes holds the type bound by `if let PATTERN = expr`.
 	IfLetTypes map[*ast.IfLetStmt]Type
-	ExprTypes  map[ast.Expr]Type
-	LetTypes   map[*ast.LetStmt]Type
+	// Moves marks expressions that transfer ownership.
+	Moves     map[ast.Expr]bool
+	ExprTypes map[ast.Expr]Type
+	LetTypes  map[*ast.LetStmt]Type
 }

@@ -35,6 +35,11 @@ func MonoTypes(info *Info) []Type {
 	for _, t := range info.IfLetTypes {
 		add(t)
 	}
+	for _, st := range info.Structs {
+		for _, f := range st.Order {
+			add(st.Fields[f])
+		}
+	}
 	for _, s := range info.Funcs {
 		for _, p := range s.Params {
 			add(p)

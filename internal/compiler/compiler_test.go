@@ -2,7 +2,9 @@ package compiler_test
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -384,5 +386,81 @@ func TestExamplesCompile(t *testing.T) {
 		if _, errs := compiler.Compile(string(src)); len(errs) > 0 {
 			t.Errorf("%s: %v", filepath.Base(f), errs)
 		}
+	}
+}
+
+// TestCBackendNoLeaks compiles a program that allocates heavily and verifies
+// that the C backend releases every owning value.
+func TestCBackendNoLeaks(t *testing.T) {
+	cc, err := exec.LookPath("gcc")
+	if err != nil {
+		t.Skip("gcc not found")
+	}
+
+	src := `struct User { name: string, tags: []string }
+
+fn makeUser(name: string) -> User {
+    let tags = ["active", "new"]
+    return User { name: name, tags: tags }
+}
+
+fn find(x: int) -> Option<string> {
+    if x > 0 { return Some("positive") }
+    return None
+}
+
+fn parse(s: string) -> Result<string, string> {
+    if s == "" { return Err("empty") }
+    return Ok(s + "!")
+}
+
+fn chain(s: string) -> Result<string, string> {
+    let v = parse(s)?
+    return Ok(v + "?")
+}
+
+fn main() {
+    let mut i = 0
+    let mut total = 0
+    while i < 200 {
+        let u = makeUser("nsvl")
+        total = total + len(u.name)
+        let o = find(i)
+        if let Some(s) = o { total = total + len(s) }
+        let r = chain("x")
+        if let Ok(v) = r { total = total + len(v) }
+        i = i + 1
+    }
+    println(total)
+}`
+
+	cSrc, errs := compiler.CompileWith(src, compiler.BackendC)
+	if len(errs) > 0 {
+		t.Fatalf("compile errors: %v", errs)
+	}
+
+	dir := t.TempDir()
+	cFile := filepath.Join(dir, "main.c")
+	if err := os.WriteFile(cFile, []byte(cSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "prog")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	build := exec.Command(cc, "-std=c23", "-O1", "-o", bin, cFile)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("gcc failed: %v\n%s", err, out)
+	}
+
+	run := exec.Command(bin)
+	run.Env = append(os.Environ(), "GORS_LEAKCHECK=1")
+	var stderr strings.Builder
+	run.Stderr = &stderr
+	if err := run.Run(); err != nil {
+		t.Fatalf("program failed: %v (%s)", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "leaked") {
+		t.Fatalf("memory leak: %s", stderr.String())
 	}
 }

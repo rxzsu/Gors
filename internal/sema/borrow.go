@@ -410,6 +410,7 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 	case *ast.Ident:
 		if moveCtx && !IsCopy(b.typeOf(ex)) {
 			b.moveOut(ex.Name, ex.At)
+			b.info.Moves[ex] = true
 			return
 		}
 		b.readIdent(ex.Name, ex.At)
@@ -427,6 +428,7 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 			if root, ok := rootIdent(ex.X); ok {
 				b.moveOut(root, ex.At)
 			}
+			b.info.Moves[ex] = true
 		}
 
 	case *ast.Index:

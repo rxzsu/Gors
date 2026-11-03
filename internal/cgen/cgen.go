@@ -3,6 +3,11 @@
 // This is the "fast" backend: no runtime, no GC, no goroutine scheduler.
 // The generated C is compiled with -std=c23 -O2 and produces the same machine
 // code a hand-written C program would.
+//
+// Memory: every owning value (string, slice, struct/option/result containing
+// them) is released at the end of its scope and on every return path. GoRs has
+// move semantics, so there is exactly one owner at any time and no refcounts
+// are needed.
 package cgen
 
 import (
@@ -21,7 +26,61 @@ const prelude = `#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-typedef const char* gors_str;
+typedef char* gors_str;
+
+static inline void gors_oom(void) {
+    fputs("gors: out of memory\n", stderr);
+    exit(1);
+}
+
+// Allocation accounting: set GORS_LEAKCHECK=1 to report leaks at exit.
+static int64_t gors_live_allocs = 0;
+
+static void gors_leak_report(void) {
+    const char* flag = getenv("GORS_LEAKCHECK");
+    if (flag && flag[0] == '1' && gors_live_allocs != 0) {
+        fprintf(stderr, "gors: %lld leaked allocation(s)\n",
+                (long long)gors_live_allocs);
+    }
+}
+
+static void* gors_malloc(size_t n) {
+    static int registered = 0;
+    if (!registered) { atexit(gors_leak_report); registered = 1; }
+    void* p = malloc(n);
+    if (!p) gors_oom();
+    gors_live_allocs++;
+    return p;
+}
+
+static void gors_free(void* p) {
+    if (!p) return;
+    gors_live_allocs--;
+    free(p);
+}
+
+static void* gors_realloc(void* p, size_t n) {
+    void* q = realloc(p, n);
+    if (!q) gors_oom();
+    if (!p) gors_live_allocs++;
+    return q;
+}
+
+[[maybe_unused]] static gors_str gors_str_new(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* p = (char*)gors_malloc(n);
+    if (!p) gors_oom();
+    memcpy(p, s, n);
+    return p;
+}
+
+[[maybe_unused]] static void gors_str_drop(gors_str s) {
+    gors_free(s);
+}
+
+[[maybe_unused]] static int gors_str_eq(gors_str a, gors_str b) {
+    return strcmp(a, b) == 0;
+}
 
 static inline void gors_bounds(int64_t i, int64_t n) {
     if (i < 0 || i >= n) {
@@ -35,19 +94,31 @@ static inline void gors_bounds(int64_t i, int64_t n) {
 
 static void* gors_dup(const void* src, int64_t n, size_t elem) {
     size_t bytes = (size_t)n * elem;
-    void* out = malloc(bytes ? bytes : 1);
-    if (!out) { fputs("gors: out of memory\n", stderr); exit(1); }
+    void* out = gors_malloc(bytes ? bytes : 1);
+    if (!out) gors_oom();
     if (bytes) memcpy(out, src, bytes);
     return out;
 }
 
-[[maybe_unused]] static gors_str gors_concat(gors_str a, gors_str b) {
+[[maybe_unused]] static gors_str gors_concat_impl(gors_str a, gors_str b) {
     size_t la = strlen(a), lb = strlen(b);
-    char* out = (char*)malloc(la + lb + 1);
-    if (!out) { fputs("gors: out of memory\n", stderr); exit(1); }
+    char* out = (char*)gors_malloc(la + lb + 1);
+    if (!out) gors_oom();
     memcpy(out, a, la);
     memcpy(out + la, b, lb + 1);
     return out;
+}
+
+// Concatenate and release the operands that were temporaries.
+[[maybe_unused]] static gors_str gors_concat_take(gors_str a, gors_str b, int take_a, int take_b) {
+    gors_str out = gors_concat_impl(a, b);
+    if (take_a) gors_str_drop(a);
+    if (take_b) gors_str_drop(b);
+    return out;
+}
+
+[[maybe_unused]] static gors_str gors_concat(gors_str a, gors_str b) {
+    return gors_concat_impl(a, b);
 }
 `
 
@@ -58,12 +129,53 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 	g.out.WriteString(prelude)
 	g.out.WriteString("\n")
 
+	// 1. Type definitions in dependency order (C needs complete types for
+	// struct fields, so a plain forward declaration is not enough).
+	mono := sema.MonoTypes(info)
+	order := g.topoSort(prog, mono)
+	for _, t := range order {
+		g.line("typedef struct %s %s;", typeName(t), typeName(t))
+	}
+	g.out.WriteString("\n")
+	for _, t := range order {
+		g.genTypeDef(t)
+	}
+	g.out.WriteString("\n")
+
+	// 2. Drop and push prototypes.
 	for _, sd := range prog.Structs {
-		g.genStruct(sd)
+		if st, ok := info.Structs[sd.Name]; ok && structOwns(st) {
+			g.line("[[maybe_unused]] static void %s_drop(%s* p);", mangle(sd.Name), mangle(sd.Name))
+		}
 	}
-	for _, t := range sema.MonoTypes(info) {
-		g.genMono(t)
+	for _, t := range mono {
+		if ownsValue(t) {
+			g.line("[[maybe_unused]] static void %s_drop(%s* p);", sema.MonoName(t), sema.MonoName(t))
+		}
+		if sl, ok := t.(*sema.Slice); ok {
+			g.line("[[maybe_unused]] static void %s_push(%s* s, %s v);",
+				sema.MonoName(sl), sema.MonoName(sl), cType(sl.Elem))
+		}
 	}
+	g.out.WriteString("\n")
+
+	// 3. Drop and push implementations.
+	for _, sd := range prog.Structs {
+		if st, ok := info.Structs[sd.Name]; ok && structOwns(st) {
+			g.genStructDrop(st)
+		}
+	}
+	for _, t := range mono {
+		if ownsValue(t) {
+			g.genMonoDrop(t)
+		}
+		if sl, ok := t.(*sema.Slice); ok {
+			g.genSlicePush(sl)
+		}
+	}
+	g.out.WriteString("\n")
+
+	// 4. Function prototypes and bodies.
 	for _, fn := range prog.Funcs {
 		if fn.Name == "main" && fn.Recv == nil {
 			continue
@@ -80,12 +192,24 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 	return g.out.String(), nil
 }
 
+type ownedVar struct {
+	name  string
+	typ   sema.Type
+	owned bool
+}
+
+type scope struct {
+	vars []ownedVar
+}
+
 type gen struct {
 	out     *bytes.Buffer
 	pending bytes.Buffer
 	info    *sema.Info
 	ind     int
 	tmp     int
+
+	scopes []*scope
 }
 
 func (g *gen) temp() string {
@@ -122,46 +246,311 @@ func (g *gen) emitPendingAt(extra int, format string, args ...any) {
 	g.pending.WriteString("\n")
 }
 
+// --- ownership ---
+
+func (g *gen) pushScope() { g.scopes = append(g.scopes, &scope{}) }
+func (g *gen) popScope()  { g.scopes = g.scopes[:len(g.scopes)-1] }
+
+func (g *gen) declareOwned(name string, t sema.Type) {
+	if len(g.scopes) == 0 {
+		return
+	}
+	sc := g.scopes[len(g.scopes)-1]
+	sc.vars = append(sc.vars, ownedVar{name: name, typ: t, owned: ownsValue(t)})
+}
+
+func (g *gen) markMoved(name string) {
+	for i := len(g.scopes) - 1; i >= 0; i-- {
+		sc := g.scopes[i]
+		for j := range sc.vars {
+			if sc.vars[j].name == name {
+				sc.vars[j].owned = false
+				return
+			}
+		}
+	}
+}
+
+func (g *gen) emitDrop(name string, t sema.Type) {
+	switch tt := t.(type) {
+	case *sema.Basic:
+		if tt.Name == "string" {
+			g.line("gors_str_drop(%s);", name)
+		}
+	case *sema.Slice:
+		g.line("%s_drop(&%s);", sema.MonoName(tt), name)
+	case *sema.StructT:
+		if structOwns(tt) {
+			g.line("%s_drop(&%s);", mangle(tt.Name), name)
+		}
+	case *sema.OptionT, *sema.ResultT:
+		if ownsValue(tt) {
+			g.line("%s_drop(&%s);", sema.MonoName(tt), name)
+		}
+	}
+}
+
+func (g *gen) dropScope() {
+	if len(g.scopes) == 0 {
+		return
+	}
+	sc := g.scopes[len(g.scopes)-1]
+	for i := len(sc.vars) - 1; i >= 0; i-- {
+		v := &sc.vars[i]
+		if v.owned {
+			g.emitDrop(v.name, v.typ)
+			v.owned = false
+		}
+	}
+}
+
+func (g *gen) dropAll() {
+	for i := len(g.scopes) - 1; i >= 0; i-- {
+		sc := g.scopes[i]
+		for j := len(sc.vars) - 1; j >= 0; j-- {
+			v := &sc.vars[j]
+			if v.owned {
+				g.emitDrop(v.name, v.typ)
+				v.owned = false
+			}
+		}
+	}
+}
+
+// ownsValue reports whether a value of type t must be released.
+func ownsValue(t sema.Type) bool {
+	switch tt := t.(type) {
+	case *sema.Basic:
+		return tt.Name == "string"
+	case *sema.Slice:
+		return true
+	case *sema.StructT:
+		return structOwns(tt)
+	case *sema.OptionT:
+		return ownsValue(tt.Elem)
+	case *sema.ResultT:
+		return ownsValue(tt.Ok) || ownsValue(tt.Err)
+	}
+	return false
+}
+
+func structOwns(st *sema.StructT) bool {
+	return structOwnsVisited(st, map[*sema.StructT]bool{})
+}
+
+func structOwnsVisited(st *sema.StructT, seen map[*sema.StructT]bool) bool {
+	if seen[st] {
+		return false
+	}
+	seen[st] = true
+	for _, name := range st.Order {
+		if ownsValue(st.Fields[name]) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- declarations ---
 
-func (g *gen) genStruct(sd *ast.StructDecl) {
-	g.line("typedef struct %s {", mangle(sd.Name))
+func typeName(t sema.Type) string {
+	if st, ok := t.(*sema.StructT); ok {
+		return mangle(st.Name)
+	}
+	return sema.MonoName(t)
+}
+
+// topoSort orders type definitions so that every type is declared after the
+// types it contains by value.
+func (g *gen) topoSort(prog *ast.Program, mono []sema.Type) []sema.Type {
+	var order []sema.Type
+	done := map[string]bool{}
+
+	var visit func(t sema.Type)
+	visit = func(t sema.Type) {
+		if t == nil {
+			return
+		}
+		switch t.(type) {
+		case *sema.Basic, *sema.Ptr, *sema.Void:
+			return
+		}
+		key := typeName(t)
+		if done[key] {
+			return
+		}
+		done[key] = true
+
+		switch tt := t.(type) {
+		case *sema.StructT:
+			for _, f := range tt.Order {
+				if _, isPtr := tt.Fields[f].(*sema.Ptr); !isPtr {
+					visit(tt.Fields[f])
+				}
+			}
+		case *sema.OptionT:
+			visit(tt.Elem)
+		case *sema.ResultT:
+			visit(tt.Ok)
+			visit(tt.Err)
+		case *sema.Slice:
+			visit(tt.Elem)
+		}
+		order = append(order, t)
+	}
+
+	for _, sd := range prog.Structs {
+		if st, ok := g.info.Structs[sd.Name]; ok {
+			visit(st)
+		}
+	}
+	for _, t := range mono {
+		visit(t)
+	}
+	return order
+}
+
+func (g *gen) genTypeDef(t sema.Type) {
+	switch tt := t.(type) {
+	case *sema.StructT:
+		g.genStructDef(tt)
+	default:
+		g.genMonoTypedef(t)
+	}
+}
+
+func (g *gen) genStructDef(st *sema.StructT) {
+	g.line("struct %s {", mangle(st.Name))
 	g.ind++
-	for _, f := range sd.Fields {
-		g.line("%s %s;", g.typeOf(f.Type), mangle(f.Name))
+	for _, f := range st.Order {
+		g.line("%s %s;", cType(st.Fields[f]), mangle(f))
 	}
 	g.ind--
-	g.line("} %s;", mangle(sd.Name))
+	g.line("};")
 	g.line("")
 }
 
-func (g *gen) genMono(t sema.Type) {
+func (g *gen) genStructDrop(st *sema.StructT) {
+	name := mangle(st.Name)
+	g.line("[[maybe_unused]] static void %s_drop(%s* p) {", name, name)
+	g.ind++
+	for _, f := range st.Order {
+		ft := st.Fields[f]
+		if ownsValue(ft) {
+			field := "p->" + mangle(f)
+			switch tt := ft.(type) {
+			case *sema.Basic:
+				g.line("gors_str_drop(%s);", field)
+			case *sema.Slice:
+				g.line("%s_drop(&%s);", sema.MonoName(tt), field)
+			case *sema.StructT:
+				g.line("%s_drop(&%s);", mangle(tt.Name), field)
+			case *sema.OptionT, *sema.ResultT:
+				g.line("%s_drop(&%s);", sema.MonoName(tt), field)
+			}
+		}
+	}
+	g.ind--
+	g.line("}")
+	g.line("")
+}
+
+func (g *gen) genMonoTypedef(t sema.Type) {
 	name := sema.MonoName(t)
 	switch tt := t.(type) {
 	case *sema.OptionT:
-		g.line("typedef struct %s { bool some; %s val; } %s;", name, cType(tt.Elem), name)
+		g.line("struct %s { bool some; %s val; };", name, cType(tt.Elem))
 	case *sema.ResultT:
-		g.line("typedef struct %s { bool ok; %s val; %s err; } %s;",
-			name, cType(tt.Ok), cType(tt.Err), name)
+		g.line("struct %s { bool ok; %s val; %s err; };", name, cType(tt.Ok), cType(tt.Err))
 	case *sema.Slice:
-		elem := cType(tt.Elem)
-		g.line("typedef struct %s { %s* data; int64_t len; int64_t cap; } %s;",
-			name, elem, name)
-		g.line("[[maybe_unused]] static void %s_push(%s* s, %s v) {", name, name, elem)
+		g.line("struct %s { %s* data; int64_t len; int64_t cap; };", name, cType(tt.Elem))
+	}
+}
+
+func (g *gen) genMonoDrop(t sema.Type) {
+	name := sema.MonoName(t)
+	switch tt := t.(type) {
+	case *sema.OptionT:
+		g.line("[[maybe_unused]] static void %s_drop(%s* p) {", name, name)
 		g.ind++
-		g.line("if (s->len == s->cap) {")
+		g.line("if (p->some) {")
 		g.ind++
-		g.line("int64_t nc = s->cap ? s->cap * 2 : 4;")
-		g.line("%s* nd = (%s*)realloc(s->data, (size_t)nc * sizeof(%s));", elem, elem, elem)
-		g.line("if (!nd) { fputs(\"gors: out of memory\\n\", stderr); exit(1); }")
-		g.line("s->data = nd;")
-		g.line("s->cap = nc;")
+		g.emitFieldDrop("p->val", tt.Elem)
 		g.ind--
 		g.line("}")
-		g.line("s->data[s->len++] = v;")
+		g.ind--
+		g.line("}")
+	case *sema.ResultT:
+		g.line("[[maybe_unused]] static void %s_drop(%s* p) {", name, name)
+		g.ind++
+		g.line("if (p->ok) {")
+		g.ind++
+		g.emitFieldDrop("p->val", tt.Ok)
+		g.ind--
+		g.line("} else {")
+		g.ind++
+		g.emitFieldDrop("p->err", tt.Err)
+		g.ind--
+		g.line("}")
+		g.ind--
+		g.line("}")
+	case *sema.Slice:
+		g.line("[[maybe_unused]] static void %s_drop(%s* s) {", name, name)
+		g.ind++
+		if ownsValue(tt.Elem) {
+			g.line("for (int64_t i = 0; i < s->len; i++) {")
+			g.ind++
+			g.emitFieldDrop("s->data[i]", tt.Elem)
+			g.ind--
+			g.line("}")
+		}
+		g.line("gors_free(s->data);")
+		g.line("s->data = 0;")
+		g.line("s->len = 0;")
+		g.line("s->cap = 0;")
 		g.ind--
 		g.line("}")
 	}
+	g.line("")
+}
+
+func (g *gen) emitFieldDrop(expr string, t sema.Type) {
+	switch tt := t.(type) {
+	case *sema.Basic:
+		if tt.Name == "string" {
+			g.line("gors_str_drop(%s);", expr)
+		}
+	case *sema.Slice:
+		g.line("%s_drop(&%s);", sema.MonoName(tt), expr)
+	case *sema.StructT:
+		if structOwns(tt) {
+			g.line("%s_drop(&%s);", mangle(tt.Name), expr)
+		}
+	case *sema.OptionT, *sema.ResultT:
+		if ownsValue(tt) {
+			g.line("%s_drop(&%s);", sema.MonoName(tt), expr)
+		}
+	}
+}
+
+func (g *gen) genSlicePush(sl *sema.Slice) {
+	name := sema.MonoName(sl)
+	elem := cType(sl.Elem)
+	g.line("[[maybe_unused]] static void %s_push(%s* s, %s v) {", name, name, elem)
+	g.ind++
+	g.line("if (s->len == s->cap) {")
+	g.ind++
+	g.line("int64_t nc = s->cap ? s->cap * 2 : 4;")
+	g.line("%s* nd = (%s*)realloc(s->data, (size_t)nc * sizeof(%s));", elem, elem, elem)
+	g.line("if (!nd) gors_oom();")
+	g.line("s->data = nd;")
+	g.line("s->cap = nc;")
+	g.ind--
+	g.line("}")
+	g.line("s->data[s->len++] = v;")
+	g.ind--
+	g.line("}")
+	g.line("")
 }
 
 func (g *gen) funcSig(fn *ast.FuncDecl) (*sema.FuncSig, int) {
@@ -230,7 +619,6 @@ func (g *gen) signature(fn *ast.FuncDecl) string {
 		}
 	}
 
-	// C23: empty parentheses mean "no parameters".
 	prefix := "[[maybe_unused]] static "
 	if fn.Name == "main" && fn.Recv == nil {
 		prefix = ""
@@ -238,7 +626,6 @@ func (g *gen) signature(fn *ast.FuncDecl) string {
 	return fmt.Sprintf("%s%s %s(%s)", prefix, ret, name, strings.Join(params, ", "))
 }
 
-// cFuncName flattens methods into Point_dist2 so C keeps a flat namespace.
 func cFuncName(fn *ast.FuncDecl) string {
 	if fn.Recv != nil {
 		return mangle(receiverBase(fn.Recv.Type) + "_" + fn.Name)
@@ -262,12 +649,31 @@ func (g *gen) genFunc(fn *ast.FuncDecl) {
 	}
 	g.line("%s {", g.signature(fn))
 	g.ind++
-	for _, s := range fn.Body.Stmts {
-		g.genStmt(s)
-	}
+	g.genBody(fn)
 	g.ind--
 	g.line("}")
 	g.line("")
+}
+
+// genBody emits a function body with ownership tracking.
+func (g *gen) genBody(fn *ast.FuncDecl) {
+	sig, offset := g.funcSig(fn)
+	g.pushScope()
+	if fn.Recv != nil && sig != nil {
+		g.declareOwned(mangle(fn.Recv.Name), sig.Params[0])
+	}
+	if sig != nil {
+		for i, p := range fn.Params {
+			g.declareOwned(mangle(p.Name), sig.Params[i+offset])
+		}
+	}
+	for _, s := range fn.Body.Stmts {
+		g.genStmt(s)
+	}
+	if !blockTerminates(fn.Body.Stmts) {
+		g.dropScope()
+	}
+	g.popScope()
 }
 
 func (g *gen) genEntry(prog *ast.Program) {
@@ -282,9 +688,14 @@ func (g *gen) genEntry(prog *ast.Program) {
 	}
 	g.line("int main() {")
 	g.ind++
+	g.pushScope()
 	for _, s := range mainFn.Body.Stmts {
 		g.genStmt(s)
 	}
+	if !blockTerminates(mainFn.Body.Stmts) {
+		g.dropScope()
+	}
+	g.popScope()
 	g.line("return 0;")
 	g.ind--
 	g.line("}")
@@ -295,11 +706,13 @@ func (g *gen) genEntry(prog *ast.Program) {
 func (g *gen) genStmt(s ast.Stmt) {
 	switch st := s.(type) {
 	case *ast.LetStmt:
-		ct := "int64_t"
-		if t, ok := g.info.LetTypes[st]; ok {
-			ct = cType(t)
+		t, ok := g.info.LetTypes[st]
+		if !ok {
+			t = sema.Int
 		}
-		g.line("%s %s = %s;", ct, mangle(st.Name), g.expr(st.Value))
+		name := mangle(st.Name)
+		g.line("%s %s = %s;", cType(t), name, g.expr(st.Value))
+		g.declareOwned(name, t)
 
 	case *ast.AssignStmt:
 		if idx, ok := st.Target.(*ast.Index); ok {
@@ -309,7 +722,18 @@ func (g *gen) genStmt(s ast.Stmt) {
 			g.line("(%s).data[%s] = %s;", base, i, g.expr(st.Value))
 			return
 		}
+		// Replacing an owned value must release the old one first.
+		if id, ok := st.Target.(*ast.Ident); ok {
+			if t, ok := g.info.ExprTypes[st.Target]; ok && ownsValue(t) {
+				g.emitDrop(mangle(id.Name), t)
+			}
+		}
 		g.line("%s = %s;", g.expr(st.Target), g.expr(st.Value))
+		if id, ok := st.Target.(*ast.Ident); ok {
+			if t, ok := g.info.ExprTypes[st.Target]; ok && ownsValue(t) {
+				g.declareOwned(mangle(id.Name), t)
+			}
+		}
 
 	case *ast.ExprStmt:
 		if g.isVoidCall(st.X) {
@@ -319,18 +743,19 @@ func (g *gen) genStmt(s ast.Stmt) {
 		}
 
 	case *ast.ReturnStmt:
-		if st.X == nil {
-			g.line("return;")
-		} else {
-			g.line("return %s;", g.expr(st.X))
-		}
+		g.genReturn(st)
 
 	case *ast.IfStmt:
 		g.line("if (%s) {", g.expr(st.Cond))
 		g.ind++
+		g.pushScope()
 		for _, s := range st.Then.Stmts {
 			g.genStmt(s)
 		}
+		if !blockTerminates(st.Then.Stmts) {
+			g.dropScope()
+		}
+		g.popScope()
 		g.ind--
 		g.genElse(st.Else)
 
@@ -340,21 +765,57 @@ func (g *gen) genStmt(s ast.Stmt) {
 	case *ast.WhileStmt:
 		g.line("while (%s) {", g.expr(st.Cond))
 		g.ind++
+		g.pushScope()
 		for _, s := range st.Body.Stmts {
 			g.genStmt(s)
 		}
+		g.dropScope()
+		g.popScope()
 		g.ind--
 		g.line("}")
 
 	case *ast.Block:
 		g.line("{")
 		g.ind++
+		g.pushScope()
 		for _, s := range st.Stmts {
 			g.genStmt(s)
 		}
+		g.dropScope()
+		g.popScope()
 		g.ind--
 		g.line("}")
 	}
+}
+
+// genReturn releases every live owner on the way out, keeping the returned
+// value alive in a temporary.
+func (g *gen) genReturn(st *ast.ReturnStmt) {
+	// Drops are emitted for this exit path only; the ownership state of the
+	// enclosing flow must stay intact because more statements may follow.
+	emit := func(ret string) {
+		snap := g.snapshotOwned()
+		g.dropAll()
+		g.restoreOwned(snap)
+		if ret == "" {
+			g.line("return;")
+		} else {
+			g.line("return %s;", ret)
+		}
+	}
+
+	if st.X == nil {
+		emit("")
+		return
+	}
+	retT := g.info.ExprTypes[st.X]
+	if retT != nil && ownsValue(retT) {
+		tmp := g.temp()
+		g.line("%s %s = %s;", cType(retT), tmp, g.expr(st.X))
+		emit(tmp)
+		return
+	}
+	emit(g.expr(st.X))
 }
 
 func (g *gen) genElse(e ast.Stmt) {
@@ -369,15 +830,23 @@ func (g *gen) genElse(e ast.Stmt) {
 	case *ast.IfLetStmt:
 		g.line("} else {")
 		g.ind++
+		g.pushScope()
 		g.genIfLet(el)
+		g.dropScope()
+		g.popScope()
 		g.ind--
 		g.line("}")
 	case *ast.Block:
 		g.line("} else {")
 		g.ind++
+		g.pushScope()
 		for _, s := range el.Stmts {
 			g.genStmt(s)
 		}
+		if !blockTerminates(el.Stmts) {
+			g.dropScope()
+		}
+		g.popScope()
 		g.ind--
 		g.line("}")
 	}
@@ -386,9 +855,14 @@ func (g *gen) genElse(e ast.Stmt) {
 func (g *gen) genIfInline(st *ast.IfStmt) {
 	g.out.WriteString(fmt.Sprintf("if (%s) {\n", g.expr(st.Cond)))
 	g.ind++
+	g.pushScope()
 	for _, s := range st.Then.Stmts {
 		g.genStmt(s)
 	}
+	if !blockTerminates(st.Then.Stmts) {
+		g.dropScope()
+	}
+	g.popScope()
 	g.ind--
 	g.genElse(st.Else)
 }
@@ -401,6 +875,8 @@ func (g *gen) genIfLet(st *ast.IfLetStmt) {
 	ct := cType(vt)
 	tmp := g.temp()
 	g.line("%s %s = %s;", ct, tmp, g.expr(st.Value))
+	// The temporary owns the payload until it is moved into the binding.
+	g.declareOwned(tmp, vt)
 
 	cond, field := tmp+".some", "val"
 	switch st.Kind {
@@ -413,14 +889,83 @@ func (g *gen) genIfLet(st *ast.IfLetStmt) {
 	}
 
 	bound, _ := g.info.IfLetTypes[st]
+	snap := g.snapshotOwned()
+
 	g.line("if (%s) {", cond)
 	g.ind++
+	g.pushScope()
 	g.line("%s %s = %s.%s;", cType(bound), mangle(st.Name), tmp, field)
+	g.declareOwned(mangle(st.Name), bound)
+	// The binding took the payload out of the temporary.
+	g.markMoved(tmp)
 	for _, s := range st.Then.Stmts {
 		g.genStmt(s)
 	}
+	g.dropScope()
+	g.popScope()
 	g.ind--
-	g.genElse(st.Else)
+	g.restoreOwned(snap)
+
+	// If the pattern did not match, the temporary still owns the value.
+	g.line("} else {")
+	g.ind++
+	g.pushScope()
+	g.dropScopeIfOwned(tmp, vt)
+	if st.Else != nil {
+		switch el := st.Else.(type) {
+		case *ast.Block:
+			for _, s := range el.Stmts {
+				g.genStmt(s)
+			}
+		case *ast.IfStmt:
+			g.genIfInline(el)
+		case *ast.IfLetStmt:
+			g.genIfLet(el)
+		}
+	}
+	g.dropScope()
+	g.popScope()
+	g.ind--
+	g.line("}")
+}
+
+// dropScopeIfOwned releases a single temporary if it is still owned.
+func (g *gen) dropScopeIfOwned(name string, t sema.Type) {
+	for i := len(g.scopes) - 1; i >= 0; i-- {
+		sc := g.scopes[i]
+		for j := range sc.vars {
+			if sc.vars[j].name == name {
+				if sc.vars[j].owned {
+					g.emitDrop(name, t)
+					sc.vars[j].owned = false
+				}
+				return
+			}
+		}
+	}
+}
+
+// blockTerminates reports whether control always leaves the block via return.
+func blockTerminates(stmts []ast.Stmt) bool {
+	if len(stmts) == 0 {
+		return false
+	}
+	return stmtTerminates(stmts[len(stmts)-1])
+}
+
+func stmtTerminates(s ast.Stmt) bool {
+	switch st := s.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.IfStmt:
+		if st.Else == nil {
+			return false
+		}
+		return blockTerminates(st.Then.Stmts) && stmtTerminates(st.Else)
+	case *ast.Block:
+		return blockTerminates(st.Stmts)
+	}
+	return false
 }
 
 // --- expressions ---
@@ -432,7 +977,7 @@ func (g *gen) expr(e ast.Expr) string {
 	case *ast.FloatLit:
 		return strconv.FormatFloat(ex.Value, 'g', -1, 64)
 	case *ast.StringLit:
-		return cQuote(ex.Value)
+		return "gors_str_new(" + cQuote(ex.Value) + ")"
 	case *ast.BoolLit:
 		if ex.Value {
 			return "true"
@@ -446,31 +991,48 @@ func (g *gen) expr(e ast.Expr) string {
 			}
 			return "0"
 		}
-		return mangle(ex.Name)
+		name := mangle(ex.Name)
+		if g.info.Moves[ex] {
+			g.markMoved(name)
+		}
+		return name
 
 	case *ast.Unary:
 		return "(" + ex.Op + g.expr(ex.X) + ")"
 
 	case *ast.Binary:
-		if ex.Op == "+" && isStringType(g.info.ExprTypes[ex.X]) {
-			return "gors_concat(" + g.expr(ex.X) + ", " + g.expr(ex.Y) + ")"
+		if (ex.Op == "==" || ex.Op == "!=") && isStringType(g.info.ExprTypes[ex.X]) {
+			cmp := "gors_str_eq(" + g.strOperand(ex.X) + ", " + g.strOperand(ex.Y) + ")"
+			if ex.Op == "!=" {
+				return "(!(" + cmp + "))"
+			}
+			return cmp
 		}
-		return "(" + g.expr(ex.X) + " " + ex.Op + " " + g.expr(ex.Y) + ")"
+		if ex.Op == "+" && isStringType(g.info.ExprTypes[ex.X]) {
+			ta := g.isConcatExpr(ex.X)
+			tb := g.isConcatExpr(ex.Y)
+			if ta || tb {
+				return fmt.Sprintf("gors_concat_take(%s, %s, %d, %d)",
+					g.strOperand(ex.X), g.strOperand(ex.Y), b2i(ta), b2i(tb))
+			}
+			return "gors_concat(" + g.strOperand(ex.X) + ", " + g.strOperand(ex.Y) + ")"
+		}
+		left := g.expr(ex.X)
+		right := g.expr(ex.Y)
+		return "(" + left + " " + ex.Op + " " + right + ")"
 
 	case *ast.AddrOf:
 		return "&" + g.expr(ex.X)
 
 	case *ast.Field:
-		if g.info.MethodSel[ex] {
-			sep := "."
-			if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
-				sep = "->"
-			}
-			return g.expr(ex.X) + sep + mangle(ex.Name)
-		}
 		sep := "."
 		if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
 			sep = "->"
+		}
+		if g.info.Moves[ex] {
+			if root, ok := rootName(ex.X); ok {
+				g.markMoved(root)
+			}
 		}
 		return g.expr(ex.X) + sep + mangle(ex.Name)
 
@@ -497,6 +1059,41 @@ func (g *gen) expr(e ast.Expr) string {
 		return g.call(ex)
 	}
 	return "0"
+}
+
+// isConcatExpr reports whether e produces a freshly allocated string.
+func (g *gen) isConcatExpr(e ast.Expr) bool {
+	if b, ok := e.(*ast.Binary); ok && b.Op == "+" && isStringType(g.info.ExprTypes[b.X]) {
+		return true
+	}
+	return false
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// strOperand renders a string operand without heap-allocating literals.
+func (g *gen) strOperand(e ast.Expr) string {
+	if lit, ok := e.(*ast.StringLit); ok {
+		return cQuote(lit.Value)
+	}
+	return g.expr(e)
+}
+
+func rootName(e ast.Expr) (string, bool) {
+	switch ex := e.(type) {
+	case *ast.Ident:
+		return mangle(ex.Name), true
+	case *ast.Field:
+		return rootName(ex.X)
+	case *ast.Index:
+		return rootName(ex.X)
+	}
+	return "", false
 }
 
 func (g *gen) call(ex *ast.Call) string {
@@ -564,7 +1161,6 @@ func (g *gen) sliceLit(ex *ast.SliceLit) string {
 		strings.Join(parts, ", ") + "}, " + n + ", sizeof(" + elem + ")), .len = " + n + ", .cap = " + n + " }"
 }
 
-// lowerTry turns `expr?` into statements plus a value reference.
 func (g *gen) lowerTry(ex *ast.TryExpr) string {
 	rt, ok := g.info.ExprTypes[ex.X].(*sema.ResultT)
 	if !ok {
@@ -575,12 +1171,49 @@ func (g *gen) lowerTry(ex *ast.TryExpr) string {
 	tmp := g.temp()
 	g.emitPending("%s %s = %s;", ct, tmp, inner)
 	g.emitPending("if (!%s.ok) {", tmp)
-	g.emitPendingAt(1, "return (%s){ .err = %s.err };", ct, tmp)
+
+	// Emit the early-return branch separately so it can release every live
+	// owner without disturbing the ownership state of the happy path.
+	g.flush()
+	snap := g.snapshotOwned()
+	var buf bytes.Buffer
+	oldOut, oldInd := g.out, g.ind
+	g.out = &buf
+	g.ind = oldInd + 1
+	g.line("%s __gors_ret = %s;", ct, tmp)
+	g.dropAll()
+	g.line("return __gors_ret;")
+	g.out = oldOut
+	g.ind = oldInd
+	g.restoreOwned(snap)
+
+	g.pending.Write(buf.Bytes())
 	g.emitPending("}")
 	return tmp + ".val"
 }
 
-// methodCall lowers p.dist2(x) to Point_dist2(&p, x).
+func (g *gen) snapshotOwned() []bool {
+	var out []bool
+	for _, sc := range g.scopes {
+		for _, v := range sc.vars {
+			out = append(out, v.owned)
+		}
+	}
+	return out
+}
+
+func (g *gen) restoreOwned(snap []bool) {
+	i := 0
+	for _, sc := range g.scopes {
+		for j := range sc.vars {
+			if i < len(snap) {
+				sc.vars[j].owned = snap[i]
+			}
+			i++
+		}
+	}
+}
+
 func (g *gen) methodCall(c *ast.Call, field *ast.Field) string {
 	recvType := g.info.ExprTypes[field.X]
 	base := recvType
@@ -627,12 +1260,17 @@ func (g *gen) args(args []ast.Expr) string {
 	return strings.Join(parts, ", ")
 }
 
-// printCall builds a single printf with a matching format string.
 func (g *gen) printCall(args []ast.Expr, newline bool) string {
 	var fmts []string
 	var vals []string
 	for _, a := range args {
 		t := g.info.ExprTypes[a]
+		// String literals passed to println are not allocated.
+		if lit, ok := a.(*ast.StringLit); ok {
+			fmts = append(fmts, "%s")
+			vals = append(vals, cQuote(lit.Value))
+			continue
+		}
 		expr := g.expr(a)
 		if p, ok := t.(*sema.Ptr); ok {
 			expr = "*(" + expr + ")"
@@ -726,7 +1364,7 @@ func (g *gen) typeOf(te ast.TypeExpr) string {
 	case *ast.PtrType:
 		return g.typeOf(t.Elem) + "*"
 	case *ast.SliceType:
-		return sema.MonoName(&sema.Slice{Elem: &sema.Basic{Name: "int"}})
+		return "Slice_int64"
 	}
 	return "void"
 }
