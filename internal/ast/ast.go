@@ -9,9 +9,10 @@ type TypeExpr interface {
 	typeExpr()
 }
 
-// NamedType is a primitive or struct type name.
+// NamedType is a primitive, a struct, or a generic type like Option<int>.
 type NamedType struct {
 	Name string
+	Args []TypeExpr
 	At   token.Pos
 }
 
@@ -115,6 +116,12 @@ type FieldInit struct {
 	At    token.Pos
 }
 
+// TryExpr is expr? — unwrap Result or return the error.
+type TryExpr struct {
+	X  Expr
+	At token.Pos
+}
+
 // AddrOf is &x or &mut x.
 type AddrOf struct {
 	X   Expr
@@ -133,6 +140,7 @@ func (e *Call) expr()      {}
 func (e *Field) expr()     {}
 func (e *Index) expr()     {}
 func (e *StructLit) expr() {}
+func (e *TryExpr) expr()   {}
 func (e *AddrOf) expr()    {}
 
 func (e *Ident) Pos() token.Pos     { return e.At }
@@ -146,6 +154,7 @@ func (e *Call) Pos() token.Pos      { return e.At }
 func (e *Field) Pos() token.Pos     { return e.At }
 func (e *Index) Pos() token.Pos     { return e.At }
 func (e *StructLit) Pos() token.Pos { return e.At }
+func (e *TryExpr) Pos() token.Pos   { return e.At }
 func (e *AddrOf) Pos() token.Pos    { return e.At }
 
 // Stmt is a statement node.
@@ -185,6 +194,16 @@ type IfStmt struct {
 	At   token.Pos
 }
 
+// IfLetStmt is `if let Some(v) = expr { } else { }`.
+type IfLetStmt struct {
+	Kind  string // Some, Ok, Err
+	Name  string
+	Value Expr
+	Then  *Block
+	Else  Stmt // may be nil
+	At    token.Pos
+}
+
 type WhileStmt struct {
 	Cond Expr
 	Body *Block
@@ -201,6 +220,7 @@ func (s *AssignStmt) stmt() {}
 func (s *ExprStmt) stmt()   {}
 func (s *ReturnStmt) stmt() {}
 func (s *IfStmt) stmt()     {}
+func (s *IfLetStmt) stmt()  {}
 func (s *WhileStmt) stmt()  {}
 func (s *Block) stmt()      {}
 
@@ -209,6 +229,7 @@ func (s *AssignStmt) Pos() token.Pos { return s.At }
 func (s *ExprStmt) Pos() token.Pos   { return s.At }
 func (s *ReturnStmt) Pos() token.Pos { return s.At }
 func (s *IfStmt) Pos() token.Pos     { return s.At }
+func (s *IfLetStmt) Pos() token.Pos  { return s.At }
 func (s *WhileStmt) Pos() token.Pos  { return s.At }
 func (s *Block) Pos() token.Pos      { return s.At }
 

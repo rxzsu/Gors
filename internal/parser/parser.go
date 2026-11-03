@@ -172,7 +172,18 @@ func (p *Parser) parseType() ast.TypeExpr {
 		return &ast.SliceType{Elem: elem, At: t.Pos}
 	case p.check(token.IDENT):
 		p.advance()
-		return &ast.NamedType{Name: t.Lit, At: t.Pos}
+		nt := &ast.NamedType{Name: t.Lit, At: t.Pos}
+		if p.check(token.LT) {
+			p.advance()
+			for {
+				nt.Args = append(nt.Args, p.parseType())
+				if !p.accept(token.COMMA) {
+					break
+				}
+			}
+			p.expect(token.GT)
+		}
+		return nt
 	default:
 		p.errorf(t.Pos, "expected a type, got %q", t.Type)
 		p.advance()
@@ -228,6 +239,26 @@ func (p *Parser) parseLet() ast.Stmt {
 
 func (p *Parser) parseIf() ast.Stmt {
 	start := p.expect(token.IF)
+	if p.accept(token.LET) {
+		kind := p.expect(token.IDENT)
+		p.expect(token.LPAREN)
+		name := p.expect(token.IDENT)
+		p.expect(token.RPAREN)
+		p.expect(token.ASSIGN)
+		p.noStructLit++
+		val := p.parseExpr()
+		p.noStructLit--
+		then := p.parseBlock()
+		stmt := &ast.IfLetStmt{Kind: kind.Lit, Name: name.Lit, Value: val, Then: then, At: start.Pos}
+		if p.accept(token.ELSE) {
+			if p.check(token.IF) {
+				stmt.Else = p.parseIf()
+			} else {
+				stmt.Else = p.parseBlock()
+			}
+		}
+		return stmt
+	}
 	p.noStructLit++
 	cond := p.parseExpr()
 	p.noStructLit--
@@ -374,6 +405,9 @@ func (p *Parser) parsePostfix() ast.Expr {
 			idx := p.parseExpr()
 			p.expect(token.RBRACK)
 			x = &ast.Index{X: x, Idx: idx, At: start.Pos}
+		case p.check(token.QUESTION):
+			q := p.advance()
+			x = &ast.TryExpr{X: x, At: q.Pos}
 		default:
 			return x
 		}

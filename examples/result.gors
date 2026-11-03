@@ -1,0 +1,25 @@
+fn parsePositive(s: string) -> Result<int, string> {
+    if s == "" {
+        return Err("empty input")
+    }
+    return Ok(1)
+}
+
+fn double(s: string) -> Result<int, string> {
+    let v = parsePositive(s)?
+    return Ok(v * 2)
+}
+
+fn main() {
+    let a = double("x")
+    if let Ok(v) = a {
+        println(v)
+    } else {
+        println("failed")
+    }
+
+    let b = double("")
+    if let Err(e) = b {
+        println(e)
+    }
+}

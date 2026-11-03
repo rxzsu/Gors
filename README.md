@@ -62,8 +62,8 @@ fn main() {
 ```
 
 Есть: `fn`, `let` / `let mut`, `if` / `else`, `while`, `return`, `struct`,
-методы (`fn (p: &Point) dist2()`), арифметика и сравнения, `&T` / `&mut T`,
-`println` / `print` / `len`.
+методы (`fn (p: &Point) dist2()`), `Option<T>`, `Result<T, E>`, `if let`,
+оператор `?`, арифметика и сравнения, `&T` / `&mut T`, `println` / `print` / `len`.
 
 Метод объявляется с получателем перед именем. Получатель `&T` — общий займ,
 `&mut T` — исключительный, `T` — перемещение значения:
@@ -72,6 +72,44 @@ fn main() {
 fn (p: &mut Point) shift(dx: int) { p.x = p.x + dx }
 p.shift(1)          // обычный вызов
 ```
+
+### Option и Result
+
+```go
+fn find(x: int) -> Option<int> {
+    if x > 0 { return Some(x * 2) }
+    return None
+}
+
+fn parse(s: string) -> Result<int, string> {
+    if s == "" { return Err("empty") }
+    return Ok(1)
+}
+
+fn twice(s: string) -> Result<int, string> {
+    let v = parse(s)?      // вернёт Err наверх, иначе развернёт Ok
+    return Ok(v * 2)
+}
+
+fn main() {
+    let a = find(5)
+    if let Some(v) = a {
+        println(v)
+    } else {
+        println("none")
+    }
+
+    let r = twice("x")
+    if let Ok(v) = r { println(v) }
+}
+```
+
+`None` требует контекста типа (`let x: Option<int> = None` или `return None`
+из функции, возвращающей `Option<T>`) — вывода типов из «ничего» нет.
+`?` работает только в функции, возвращающей `Result` с тем же типом ошибки.
+
+Оба типа мономорфизируются: `Option<int>` и `Option<string>` — две разные
+структуры в сгенерированном коде (`Option_int64`, `Option_str`).
 Типы: `int` (int64), `float` (float64), `bool`, `string`, структуры, ссылки, `[]T`.
 
 ## Скорость
@@ -110,6 +148,11 @@ Go и C сами по себе не проверяют ни одну из эти
 | `&mut` только от `let mut` | `let x = 1; &mut x` | `E124` |
 | Метод — только вызов | `println(p.get)` | `E143` |
 | Получатель — структура | `fn (n: int) bad()` | `E140` |
+| `None` без типа | `let x = None` | `E150` |
+| `?` вне функции с `Result` | `let v = f()?` в `fn main()` | `E161` |
+| `?` с чужим типом ошибки | `Result<int,string>` в `Result<int,int>` | `E162` |
+| `?` не на `Result` | `Option<int>?` | `E160` |
+| `if let` не на том типе | `if let Some(v) = 1` | `E151` |
 
 Займы в вызовах методов работают как в Rust: `p.get()` (получатель `&T`) требует
 отсутствия `&mut`, а `p.bump()` (получатель `&mut T`) — отсутствия любых займов.
@@ -129,7 +172,6 @@ x = 2        // ok: займ уже закончился
 
 ## Чего пока нет
 
-- нет `Option` / `Result` и оператора `?`;
 - нет слайс-литералов (тип `[]T` есть, создать значение нельзя);
 - нет замыканий, generics, модулей;
 - нет времён жизни: ссылка не может пережить владельца в структуре;

@@ -11,12 +11,13 @@ import (
 func Check(prog *ast.Program) (*Info, []*Error) {
 	c := &checker{
 		info: &Info{
-			Structs:   map[string]*StructT{},
-			Funcs:     map[string]*FuncSig{},
-			Methods:   map[string]map[string]*FuncSig{},
-			MethodSel: map[ast.Expr]bool{},
-			ExprTypes: map[ast.Expr]Type{},
-			LetTypes:  map[*ast.LetStmt]Type{},
+			Structs:    map[string]*StructT{},
+			Funcs:      map[string]*FuncSig{},
+			Methods:    map[string]map[string]*FuncSig{},
+			MethodSel:  map[ast.Expr]bool{},
+			IfLetTypes: map[*ast.IfLetStmt]Type{},
+			ExprTypes:  map[ast.Expr]Type{},
+			LetTypes:   map[*ast.LetStmt]Type{},
 		},
 	}
 	c.declareStructs(prog)
@@ -163,6 +164,31 @@ func (c *checker) resolveType(te ast.TypeExpr) Type {
 			return Bool
 		case "string":
 			return String
+		case "Option":
+			if len(t.Args) != 1 {
+				c.errf("E145", t.At, "Option requires exactly one type argument")
+				return nil
+			}
+			elem := c.resolveType(t.Args[0])
+			if elem == nil {
+				return nil
+			}
+			return &OptionT{Elem: elem}
+		case "Result":
+			if len(t.Args) != 2 {
+				c.errf("E146", t.At, "Result requires exactly two type arguments")
+				return nil
+			}
+			ok := c.resolveType(t.Args[0])
+			bad := c.resolveType(t.Args[1])
+			if ok == nil || bad == nil {
+				return nil
+			}
+			return &ResultT{Ok: ok, Err: bad}
+		}
+		if len(t.Args) > 0 {
+			c.errf("E147", t.At, "type %q is not generic", t.Name)
+			return nil
 		}
 		if st, ok := c.info.Structs[t.Name]; ok {
 			return st
@@ -262,8 +288,22 @@ func (c *checker) checkBlock(b *ast.Block) {
 func (c *checker) checkStmt(s ast.Stmt) {
 	switch st := s.(type) {
 	case *ast.LetStmt:
-		vt := c.checkExpr(st.Value)
+		var declared Type
+		if st.Type != nil {
+			declared = c.resolveType(st.Type)
+			if declared == nil {
+				return
+			}
+		}
+		var vt Type
+		if declared != nil {
+			vt = c.checkExprExpected(st.Value, declared)
+		} else {
+			vt = c.checkExpr(st.Value)
+		}
 		if vt == nil {
+			// Keep the name bound to avoid cascading "undefined name" errors.
+			c.declare(st.Name, &varInfo{Type: Int, Mut: st.Mut})
 			return
 		}
 		if _, isVoid := vt.(*Void); isVoid {
@@ -271,11 +311,7 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			return
 		}
 		final := vt
-		if st.Type != nil {
-			declared := c.resolveType(st.Type)
-			if declared == nil {
-				return
-			}
+		if declared != nil {
 			if !assignable(declared, vt) {
 				c.errf("E106", st.At, "cannot bind %s to %s", vt.String(), declared.String())
 				return
@@ -290,7 +326,10 @@ func (c *checker) checkStmt(s ast.Stmt) {
 
 	case *ast.AssignStmt:
 		tt := c.checkExpr(st.Target)
-		vt := c.checkExpr(st.Value)
+		if tt == nil {
+			return
+		}
+		vt := c.checkExprExpected(st.Value, tt)
 		if tt == nil || vt == nil {
 			return
 		}
@@ -312,7 +351,7 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			}
 			return
 		}
-		vt := c.checkExpr(st.X)
+		vt := c.checkExprExpected(st.X, c.curRet)
 		if vt == nil {
 			return
 		}
@@ -345,9 +384,96 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		}
 		c.checkBlock(st.Body)
 
+	case *ast.IfLetStmt:
+		vt := c.checkExpr(st.Value)
+		if vt == nil {
+			return
+		}
+		var bound Type
+		switch st.Kind {
+		case "Some":
+			opt, ok := vt.(*OptionT)
+			if !ok {
+				c.errf("E151", st.At, "if let Some requires Option<T>, got %s", vt.String())
+				return
+			}
+			bound = opt.Elem
+		case "Ok", "Err":
+			res, ok := vt.(*ResultT)
+			if !ok {
+				c.errf("E151", st.At, "if let %s requires Result<T, E>, got %s", st.Kind, vt.String())
+				return
+			}
+			if st.Kind == "Ok" {
+				bound = res.Ok
+			} else {
+				bound = res.Err
+			}
+		default:
+			c.errf("E152", st.At, "unknown pattern %q; expected Some, Ok or Err", st.Kind)
+			return
+		}
+		c.info.IfLetTypes[st] = bound
+		c.checkBlockWith(st.Then, st.Name, bound)
+		if st.Else != nil {
+			c.checkStmt(st.Else)
+		}
+
 	case *ast.Block:
 		c.checkBlock(st)
 	}
+}
+
+func (c *checker) checkBlockWith(b *ast.Block, name string, t Type) {
+	c.pushScope()
+	c.declare(name, &varInfo{Type: t, Mut: false})
+	for _, s := range b.Stmts {
+		c.checkStmt(s)
+	}
+	c.popScope()
+}
+
+// checkExprExpected checks e knowing the type the context expects.
+// It is what makes `None` and `Ok(x)` inferable.
+func (c *checker) checkExprExpected(e ast.Expr, expected Type) Type {
+	if expected == nil {
+		return c.checkExpr(e)
+	}
+	if id, ok := e.(*ast.Ident); ok && id.Name == "None" {
+		if _, isOpt := expected.(*OptionT); isOpt {
+			c.info.ExprTypes[e] = expected
+			return expected
+		}
+		c.errf("E150", id.At, "cannot infer the type of None; annotate it as Option<T>")
+		return nil
+	}
+	if call, ok := e.(*ast.Call); ok {
+		if id, ok := call.Fn.(*ast.Ident); ok && (id.Name == "Ok" || id.Name == "Err") {
+			rt, isRes := expected.(*ResultT)
+			if !isRes {
+				c.errf("E150", call.At, "cannot infer the Result type of %s; annotate it", id.Name)
+				for _, a := range call.Args {
+					c.checkExpr(a)
+				}
+				return nil
+			}
+			if len(call.Args) != 1 {
+				c.errf("E148", call.At, "%s takes exactly one argument", id.Name)
+				return rt
+			}
+			at := c.checkExpr(call.Args[0])
+			want := rt.Ok
+			if id.Name == "Err" {
+				want = rt.Err
+			}
+			if at != nil && !assignable(want, at) {
+				c.errf("E149", call.At, "%s expects %s, got %s", id.Name, want.String(), at.String())
+			}
+			c.info.ExprTypes[e] = rt
+			return rt
+		}
+	}
+	return c.checkExpr(e)
 }
 
 func (c *checker) checkExpr(e ast.Expr) Type {
@@ -372,6 +498,10 @@ func (c *checker) expr(e ast.Expr) Type {
 	case *ast.Ident:
 		if v, ok := c.lookup(ex.Name); ok {
 			return v.Type
+		}
+		if ex.Name == "None" {
+			c.errf("E150", ex.At, "cannot infer the type of None; annotate it as Option<T>")
+			return nil
 		}
 		if _, ok := c.info.Funcs[ex.Name]; ok {
 			c.errf("E114", ex.At, "function %q used as a value; call it instead", ex.Name)
@@ -511,7 +641,7 @@ func (c *checker) expr(e ast.Expr) Type {
 				c.errf("E128", fi.At, "struct %q has no field %q", st.Name, fi.Name)
 				continue
 			}
-			vt := c.checkExpr(fi.Value)
+			vt := c.checkExprExpected(fi.Value, ft)
 			if vt == nil {
 				continue
 			}
@@ -525,6 +655,27 @@ func (c *checker) expr(e ast.Expr) Type {
 			}
 		}
 		return st
+
+	case *ast.TryExpr:
+		xt := c.checkExpr(ex.X)
+		if xt == nil {
+			return nil
+		}
+		rt, ok := xt.(*ResultT)
+		if !ok {
+			c.errf("E160", ex.At, "operator ? requires Result<T, E>, got %s", xt.String())
+			return nil
+		}
+		cur, ok := c.curRet.(*ResultT)
+		if !ok {
+			c.errf("E161", ex.At, "operator ? requires the enclosing function to return Result<T, E>")
+			return nil
+		}
+		if !sameType(cur.Err, rt.Err) {
+			c.errf("E162", ex.At, "? propagates %s but the function returns %s", rt.Err.String(), cur.Err.String())
+			return nil
+		}
+		return rt.Ok
 
 	case *ast.Call:
 		return c.checkCall(ex)
@@ -548,6 +699,27 @@ func (c *checker) expr(e ast.Expr) Type {
 }
 
 func (c *checker) checkCall(ex *ast.Call) Type {
+	if id, ok := ex.Fn.(*ast.Ident); ok {
+		switch id.Name {
+		case "Some":
+			if len(ex.Args) != 1 {
+				c.errf("E148", ex.At, "Some takes exactly one argument")
+				return nil
+			}
+			at := c.checkExpr(ex.Args[0])
+			if at == nil {
+				return nil
+			}
+			return &OptionT{Elem: at}
+		case "Ok", "Err":
+			c.errf("E150", ex.At, "cannot infer the Result type of %s; annotate it", id.Name)
+			for _, a := range ex.Args {
+				c.checkExpr(a)
+			}
+			return nil
+		}
+	}
+
 	// Method call: p.dist2(...)
 	if field, ok := ex.Fn.(*ast.Field); ok {
 		if sig, _ := c.resolveMethod(field); sig != nil {
@@ -558,7 +730,7 @@ func (c *checker) checkCall(ex *ast.Call) Type {
 				return sig.Ret
 			}
 			for i, a := range ex.Args {
-				at := c.checkExpr(a)
+				at := c.checkExprExpected(a, sig.Params[i+1])
 				if at == nil {
 					continue
 				}
@@ -617,7 +789,7 @@ func (c *checker) checkCall(ex *ast.Call) Type {
 		return sig.Ret
 	}
 	for i, a := range ex.Args {
-		at := c.checkExpr(a)
+		at := c.checkExprExpected(a, sig.Params[i])
 		if at == nil {
 			continue
 		}

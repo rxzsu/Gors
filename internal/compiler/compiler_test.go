@@ -42,6 +42,26 @@ func TestCompiles(t *testing.T) {
 				p.set(2)
 				println(p.get())
 			}`,
+		"option": `fn find(x: int) -> Option<int> {
+				if x > 0 { return Some(x * 2) }
+				return None
+			}
+			fn main() {
+				let a = find(5)
+				if let Some(v) = a { println(v) } else { println("none") }
+			}`,
+		"result": `fn parse(s: string) -> Result<int, string> {
+				if s == "" { return Err("empty") }
+				return Ok(1)
+			}
+			fn twice(s: string) -> Result<int, string> {
+				let v = parse(s)?
+				return Ok(v * 2)
+			}
+			fn main() {
+				let r = twice("x")
+				if let Ok(v) = r { println(v) }
+			}`,
 		"while": `fn main() {
 			let mut i = 0
 			while i < 3 {
@@ -200,6 +220,61 @@ func TestRejects(t *testing.T) {
 			src: `fn (n: int) bad() { }
 				fn main() { }`,
 			code: "E140",
+		},
+		{
+			name: "None without annotation",
+			src: `fn main() {
+					let x = None
+					println(1)
+				}`,
+			code: "E150",
+		},
+		{
+			name: "? outside Result function",
+			src: `fn f() -> Result<int, string> { return Ok(1) }
+				fn main() {
+					let v = f()?
+					println(v)
+				}`,
+			code: "E161",
+		},
+		{
+			name: "? error type mismatch",
+			src: `fn f() -> Result<int, string> { return Ok(1) }
+				fn g() -> Result<int, int> {
+					let v = f()?
+					return Ok(v)
+				}
+				fn main() { }`,
+			code: "E162",
+		},
+		{
+			name: "? on non-Result",
+			src: `fn f() -> Option<int> { return Some(1) }
+				fn g() -> Result<int, string> {
+					let v = f()?
+					return Ok(v)
+				}
+				fn main() { }`,
+			code: "E160",
+		},
+		{
+			name: "if let wrong type",
+			src: `fn main() {
+					let x = 1
+					if let Some(v) = x { println(v) }
+				}`,
+			code: "E151",
+		},
+		{
+			name: "option is moved",
+			src: `fn f() -> Option<int> { return Some(1) }
+				fn main() {
+					let a = f()
+					let b = a
+					println(a)
+				}`,
+			code: "E200",
 		},
 		{
 			name: "immutable &mut",

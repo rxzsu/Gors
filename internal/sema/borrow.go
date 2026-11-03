@@ -88,6 +88,12 @@ func (b *borrowChecker) numberStmt(s ast.Stmt) {
 		if st.Else != nil {
 			b.numberStmt(st.Else)
 		}
+	case *ast.IfLetStmt:
+		b.numberExpr(st.Value)
+		b.numberBlock(st.Then)
+		if st.Else != nil {
+			b.numberStmt(st.Else)
+		}
 	case *ast.WhileStmt:
 		b.numberExpr(st.Cond)
 		b.numberBlock(st.Body)
@@ -124,6 +130,8 @@ func (b *borrowChecker) numberExpr(e ast.Expr) {
 		for _, fi := range ex.Fields {
 			b.numberExpr(fi.Value)
 		}
+	case *ast.TryExpr:
+		b.numberExpr(ex.X)
 	case *ast.AddrOf:
 		b.numberExpr(ex.X)
 	}
@@ -303,9 +311,39 @@ func (b *borrowChecker) checkStmt(s ast.Stmt) {
 		}
 		b.restore(merged, beforeLoans)
 
+	case *ast.IfLetStmt:
+		b.at(st.Value)
+		b.checkExpr(st.Value, true)
+		bound := b.info.IfLetTypes[st]
+		b.checkBlockWithName(st.Then, st.Name, bound)
+		if st.Else != nil {
+			b.checkStmt(st.Else)
+		}
+
 	case *ast.Block:
 		b.checkBlock(st)
 	}
+}
+
+// checkBlockWithName checks a block with one extra binding in scope.
+func (b *borrowChecker) checkBlockWithName(blk *ast.Block, name string, t Type) {
+	b.pushScope()
+	b.declare(name, &varState{typ: t, mut: false})
+	for _, s := range blk.Stmts {
+		b.checkStmt(s)
+	}
+	scope := b.scopes[len(b.scopes)-1]
+	alive := b.loans[:0]
+	for _, l := range b.loans {
+		if l.borrower != "" {
+			if _, local := scope[l.borrower]; local {
+				continue
+			}
+		}
+		alive = append(alive, l)
+	}
+	b.loans = alive
+	b.popScope()
 }
 
 func (b *borrowChecker) snapshot() (map[string]bool, []*loan) {
@@ -400,12 +438,24 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 		b.checkPlace(ex.X)
 		b.newBorrow(ex, "")
 
+	case *ast.TryExpr:
+		b.checkExpr(ex.X, true)
+
 	case *ast.Call:
 		b.checkCall(ex)
 	}
 }
 
 func (b *borrowChecker) checkCall(c *ast.Call) {
+	if id, ok := c.Fn.(*ast.Ident); ok {
+		switch id.Name {
+		case "Some", "Ok", "Err":
+			for _, a := range c.Args {
+				b.checkExpr(a, true)
+			}
+			return
+		}
+	}
 	if field, ok := c.Fn.(*ast.Field); ok && b.info.MethodSel[c.Fn] {
 		b.checkMethodCall(c, field)
 		return

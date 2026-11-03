@@ -1,0 +1,22 @@
+fn find(x: int) -> Option<int> {
+    if x > 0 {
+        return Some(x * 2)
+    }
+    return None
+}
+
+fn main() {
+    let a = find(5)
+    if let Some(v) = a {
+        println(v)
+    } else {
+        println("none")
+    }
+
+    let b: Option<int> = find(-1)
+    if let Some(v) = b {
+        println(v)
+    } else {
+        println("none")
+    }
+}

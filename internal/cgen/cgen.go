@@ -43,8 +43,11 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 	for _, sd := range prog.Structs {
 		g.genStruct(sd)
 	}
+	for _, t := range sema.MonoTypes(info) {
+		g.genMono(t)
+	}
 	for _, fn := range prog.Funcs {
-		if fn.Name == "main" {
+		if fn.Name == "main" && fn.Recv == nil {
 			continue
 		}
 		g.line("%s;", g.signature(fn))
@@ -60,12 +63,28 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 }
 
 type gen struct {
-	out  *bytes.Buffer
-	info *sema.Info
-	ind  int
+	out     *bytes.Buffer
+	pending bytes.Buffer
+	info    *sema.Info
+	ind     int
+	tmp     int
+}
+
+func (g *gen) temp() string {
+	g.tmp++
+	return fmt.Sprintf("_t%d", g.tmp)
+}
+
+func (g *gen) flush() {
+	if g.pending.Len() == 0 {
+		return
+	}
+	g.out.Write(g.pending.Bytes())
+	g.pending.Reset()
 }
 
 func (g *gen) line(format string, args ...any) {
+	g.flush()
 	if format == "" {
 		g.out.WriteString("\n")
 		return
@@ -74,6 +93,18 @@ func (g *gen) line(format string, args ...any) {
 	fmt.Fprintf(g.out, format, args...)
 	g.out.WriteString("\n")
 }
+
+func (g *gen) emitPending(format string, args ...any) {
+	g.emitPendingAt(0, format, args...)
+}
+
+func (g *gen) emitPendingAt(extra int, format string, args ...any) {
+	g.pending.WriteString(strings.Repeat("    ", g.ind+extra))
+	fmt.Fprintf(&g.pending, format, args...)
+	g.pending.WriteString("\n")
+}
+
+// --- declarations ---
 
 func (g *gen) genStruct(sd *ast.StructDecl) {
 	g.line("typedef struct %s {", mangle(sd.Name))
@@ -86,19 +117,79 @@ func (g *gen) genStruct(sd *ast.StructDecl) {
 	g.line("")
 }
 
+func (g *gen) genMono(t sema.Type) {
+	name := sema.MonoName(t)
+	switch tt := t.(type) {
+	case *sema.OptionT:
+		g.line("typedef struct %s { bool some; %s val; } %s;", name, cType(tt.Elem), name)
+	case *sema.ResultT:
+		g.line("typedef struct %s { bool ok; %s val; %s err; } %s;",
+			name, cType(tt.Ok), cType(tt.Err), name)
+	}
+}
+
+func (g *gen) funcSig(fn *ast.FuncDecl) (*sema.FuncSig, int) {
+	if fn.Recv != nil {
+		rt, ok := g.resolveType(fn.Recv.Type)
+		if !ok {
+			return nil, 0
+		}
+		base := rt
+		if p, isPtr := base.(*sema.Ptr); isPtr {
+			base = p.Elem
+		}
+		st, ok := base.(*sema.StructT)
+		if !ok {
+			return nil, 0
+		}
+		return g.info.Methods[st.Name][fn.Name], 1
+	}
+	return g.info.Funcs[fn.Name], 0
+}
+
+func (g *gen) resolveType(te ast.TypeExpr) (sema.Type, bool) {
+	switch t := te.(type) {
+	case *ast.NamedType:
+		switch t.Name {
+		case "int":
+			return sema.Int, true
+		case "float":
+			return sema.Float, true
+		case "bool":
+			return sema.Bool, true
+		case "string":
+			return sema.String, true
+		}
+		if st, ok := g.info.Structs[t.Name]; ok {
+			return st, true
+		}
+	case *ast.PtrType:
+		if e, ok := g.resolveType(t.Elem); ok {
+			return &sema.Ptr{Elem: e, Mut: t.Mut}, true
+		}
+	}
+	return nil, false
+}
+
 func (g *gen) signature(fn *ast.FuncDecl) string {
+	sig, offset := g.funcSig(fn)
 	name := cFuncName(fn)
 	ret := "void"
-	if fn.Ret != nil {
-		ret = g.typeOf(fn.Ret)
+	if fn.Ret != nil && sig != nil {
+		ret = cType(sig.Ret)
 	}
+
 	var params []string
 	if fn.Recv != nil {
-		params = append(params, g.typeOf(fn.Recv.Type)+" "+mangle(fn.Recv.Name))
+		rt, _ := g.resolveType(fn.Recv.Type)
+		params = append(params, cType(rt)+" "+mangle(fn.Recv.Name))
 	}
-	for _, p := range fn.Params {
-		params = append(params, g.typeOf(p.Type)+" "+mangle(p.Name))
+	if sig != nil {
+		for i, p := range fn.Params {
+			params = append(params, cType(sig.Params[i+offset])+" "+mangle(p.Name))
+		}
 	}
+
 	// C23: empty parentheses mean "no parameters".
 	prefix := "[[maybe_unused]] static "
 	if fn.Name == "main" && fn.Recv == nil {
@@ -164,13 +255,9 @@ func (g *gen) genEntry(prog *ast.Program) {
 func (g *gen) genStmt(s ast.Stmt) {
 	switch st := s.(type) {
 	case *ast.LetStmt:
-		ct := g.typeOf(st.Type)
-		if st.Type == nil {
-			if t, ok := g.info.LetTypes[st]; ok {
-				ct = cType(t)
-			} else {
-				ct = "int64_t"
-			}
+		ct := "int64_t"
+		if t, ok := g.info.LetTypes[st]; ok {
+			ct = cType(t)
 		}
 		g.line("%s %s = %s;", ct, mangle(st.Name), g.expr(st.Value))
 
@@ -198,23 +285,10 @@ func (g *gen) genStmt(s ast.Stmt) {
 			g.genStmt(s)
 		}
 		g.ind--
-		if st.Else != nil {
-			switch el := st.Else.(type) {
-			case *ast.IfStmt:
-				g.out.WriteString(strings.Repeat("    ", g.ind) + "} else ")
-				g.genIfInline(el)
-			case *ast.Block:
-				g.line("} else {")
-				g.ind++
-				for _, s := range el.Stmts {
-					g.genStmt(s)
-				}
-				g.ind--
-				g.line("}")
-			}
-		} else {
-			g.line("}")
-		}
+		g.genElse(st.Else)
+
+	case *ast.IfLetStmt:
+		g.genIfLet(st)
 
 	case *ast.WhileStmt:
 		g.line("while (%s) {", g.expr(st.Cond))
@@ -236,6 +310,32 @@ func (g *gen) genStmt(s ast.Stmt) {
 	}
 }
 
+func (g *gen) genElse(e ast.Stmt) {
+	if e == nil {
+		g.line("}")
+		return
+	}
+	switch el := e.(type) {
+	case *ast.IfStmt:
+		g.out.WriteString(strings.Repeat("    ", g.ind) + "} else ")
+		g.genIfInline(el)
+	case *ast.IfLetStmt:
+		g.line("} else {")
+		g.ind++
+		g.genIfLet(el)
+		g.ind--
+		g.line("}")
+	case *ast.Block:
+		g.line("} else {")
+		g.ind++
+		for _, s := range el.Stmts {
+			g.genStmt(s)
+		}
+		g.ind--
+		g.line("}")
+	}
+}
+
 func (g *gen) genIfInline(st *ast.IfStmt) {
 	g.out.WriteString(fmt.Sprintf("if (%s) {\n", g.expr(st.Cond)))
 	g.ind++
@@ -243,58 +343,37 @@ func (g *gen) genIfInline(st *ast.IfStmt) {
 		g.genStmt(s)
 	}
 	g.ind--
-	if st.Else != nil {
-		if nested, ok := st.Else.(*ast.IfStmt); ok {
-			g.out.WriteString(strings.Repeat("    ", g.ind) + "} else ")
-			g.genIfInline(nested)
-			return
-		}
-		g.line("} else {")
-		g.ind++
-		if blk, ok := st.Else.(*ast.Block); ok {
-			for _, s := range blk.Stmts {
-				g.genStmt(s)
-			}
-		}
-		g.ind--
-		g.line("}")
-		return
-	}
-	g.line("}")
+	g.genElse(st.Else)
 }
 
-func (g *gen) isVoidCall(e ast.Expr) bool {
-	call, ok := e.(*ast.Call)
+func (g *gen) genIfLet(st *ast.IfLetStmt) {
+	vt, ok := g.info.ExprTypes[st.Value]
 	if !ok {
-		return false
+		return
 	}
-	if field, ok := call.Fn.(*ast.Field); ok && g.info.MethodSel[field] {
-		recvType := g.info.ExprTypes[field.X]
-		base := recvType
-		if p, ok := base.(*sema.Ptr); ok {
-			base = p.Elem
-		}
-		if st, ok := base.(*sema.StructT); ok {
-			if sig := g.info.Methods[st.Name][field.Name]; sig != nil {
-				if _, isVoid := sig.Ret.(*sema.Void); isVoid {
-					return true
-				}
-			}
-		}
-		return false
+	ct := cType(vt)
+	tmp := g.temp()
+	g.line("%s %s = %s;", ct, tmp, g.expr(st.Value))
+
+	cond, field := tmp+".some", "val"
+	switch st.Kind {
+	case "Some":
+		cond, field = tmp+".some", "val"
+	case "Ok":
+		cond, field = tmp+".ok", "val"
+	case "Err":
+		cond, field = "!"+tmp+".ok", "err"
 	}
-	if id, ok := call.Fn.(*ast.Ident); ok {
-		switch id.Name {
-		case "println", "print":
-			return true
-		}
-		if sig, ok := g.info.Funcs[id.Name]; ok {
-			if _, isVoid := sig.Ret.(*sema.Void); isVoid {
-				return true
-			}
-		}
+
+	bound, _ := g.info.IfLetTypes[st]
+	g.line("if (%s) {", cond)
+	g.ind++
+	g.line("%s %s = %s.%s;", cType(bound), mangle(st.Name), tmp, field)
+	for _, s := range st.Then.Stmts {
+		g.genStmt(s)
 	}
-	return false
+	g.ind--
+	g.genElse(st.Else)
 }
 
 // --- expressions ---
@@ -314,6 +393,12 @@ func (g *gen) expr(e ast.Expr) string {
 		return "false"
 
 	case *ast.Ident:
+		if ex.Name == "None" {
+			if t, ok := g.info.ExprTypes[ex]; ok {
+				return "(" + sema.MonoName(t) + "){0}"
+			}
+			return "0"
+		}
 		return mangle(ex.Name)
 
 	case *ast.Unary:
@@ -329,6 +414,13 @@ func (g *gen) expr(e ast.Expr) string {
 		return "&" + g.expr(ex.X)
 
 	case *ast.Field:
+		if g.info.MethodSel[ex] {
+			sep := "."
+			if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
+				sep = "->"
+			}
+			return g.expr(ex.X) + sep + mangle(ex.Name)
+		}
 		sep := "."
 		if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
 			sep = "->"
@@ -345,23 +437,61 @@ func (g *gen) expr(e ast.Expr) string {
 		}
 		return "(" + mangle(ex.Type) + "){ " + strings.Join(parts, ", ") + " }"
 
+	case *ast.TryExpr:
+		return g.lowerTry(ex)
+
 	case *ast.Call:
-		if field, ok := ex.Fn.(*ast.Field); ok && g.info.MethodSel[field] {
-			return g.methodCall(ex, field)
-		}
-		if id, ok := ex.Fn.(*ast.Ident); ok {
-			switch id.Name {
-			case "println":
-				return g.printCall(ex.Args, true)
-			case "print":
-				return g.printCall(ex.Args, false)
-			case "len":
-				return "strlen(" + g.args(ex.Args) + ")"
-			}
-		}
-		return mangle(callName(ex.Fn)) + "(" + g.args(ex.Args) + ")"
+		return g.call(ex)
 	}
 	return "0"
+}
+
+func (g *gen) call(ex *ast.Call) string {
+	if id, ok := ex.Fn.(*ast.Ident); ok {
+		switch id.Name {
+		case "Some":
+			rt, ok := g.info.ExprTypes[ex].(*sema.OptionT)
+			if !ok {
+				return "0"
+			}
+			return "(" + sema.MonoName(rt) + "){ .some = true, .val = " + g.args(ex.Args) + " }"
+		case "Ok", "Err":
+			rt, ok := g.info.ExprTypes[ex].(*sema.ResultT)
+			if !ok {
+				return "0"
+			}
+			if id.Name == "Ok" {
+				return "(" + sema.MonoName(rt) + "){ .ok = true, .val = " + g.args(ex.Args) + " }"
+			}
+			return "(" + sema.MonoName(rt) + "){ .err = " + g.args(ex.Args) + " }"
+		case "println":
+			return g.printCall(ex.Args, true)
+		case "print":
+			return g.printCall(ex.Args, false)
+		case "len":
+			return "strlen(" + g.args(ex.Args) + ")"
+		}
+	}
+	if field, ok := ex.Fn.(*ast.Field); ok && g.info.MethodSel[field] {
+		return g.methodCall(ex, field)
+	}
+	return mangle(callName(ex.Fn)) + "(" + g.args(ex.Args) + ")"
+}
+
+// lowerTry turns `expr?` into statements plus a value reference.
+func (g *gen) lowerTry(ex *ast.TryExpr) string {
+	rt, ok := g.info.ExprTypes[ex.X].(*sema.ResultT)
+	if !ok {
+		return "0"
+	}
+	ct := cType(rt)
+	inner := g.expr(ex.X)
+	tmp := g.temp()
+	g.emitPending("%s %s = %s;", ct, tmp, inner)
+	g.emitPending("if (!%s.ok) {", tmp)
+	g.emitPendingAt(1, "return (%s){ .err = %s.err };", ct, tmp)
+	g.emitPending("}")
+	return tmp + ".val"
 }
 
 // methodCall lowers p.dist2(x) to Point_dist2(&p, x).
@@ -453,9 +583,46 @@ func (g *gen) printCall(args []ast.Expr, newline bool) string {
 	return "printf(" + cQuote(format) + ", " + strings.Join(vals, ", ") + ")"
 }
 
+func (g *gen) isVoidCall(e ast.Expr) bool {
+	call, ok := e.(*ast.Call)
+	if !ok {
+		return false
+	}
+	if field, ok := call.Fn.(*ast.Field); ok && g.info.MethodSel[field] {
+		recvType := g.info.ExprTypes[field.X]
+		base := recvType
+		if p, ok := base.(*sema.Ptr); ok {
+			base = p.Elem
+		}
+		if st, ok := base.(*sema.StructT); ok {
+			if sig := g.info.Methods[st.Name][field.Name]; sig != nil {
+				if _, isVoid := sig.Ret.(*sema.Void); isVoid {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if id, ok := call.Fn.(*ast.Ident); ok {
+		switch id.Name {
+		case "println", "print":
+			return true
+		}
+		if sig, ok := g.info.Funcs[id.Name]; ok {
+			if _, isVoid := sig.Ret.(*sema.Void); isVoid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (g *gen) typeOf(te ast.TypeExpr) string {
 	if te == nil {
 		return "void"
+	}
+	if t, ok := g.resolveType(te); ok {
+		return cType(t)
 	}
 	switch t := te.(type) {
 	case *ast.NamedType:
@@ -497,6 +664,8 @@ func cType(t sema.Type) string {
 		return cType(tt.Elem) + "*"
 	case *sema.Slice:
 		return cType(tt.Elem) + "*"
+	case *sema.OptionT, *sema.ResultT:
+		return sema.MonoName(tt)
 	}
 	return "int64_t"
 }
@@ -543,7 +712,7 @@ var cReserved = map[string]bool{
 	"restrict": true, "return": true, "short": true, "signed": true, "sizeof": true,
 	"static": true, "struct": true, "switch": true, "typedef": true, "union": true,
 	"unsigned": true, "void": true, "volatile": true, "while": true,
-	"bool": true, "true": true, "false": true, "NULL": true,
+	"bool": true, "true": true, "false": true, "NULL": true, "nullptr": true,
 	"int64_t": true, "uint64_t": true, "size_t": true, "double_t": true,
 	"printf": true, "puts": true, "malloc": true, "free": true, "memcpy": true,
 	"strlen": true, "exit": true, "stderr": true, "stdout": true, "main": true,
@@ -557,7 +726,6 @@ func mangle(name string) string {
 	if name == "" {
 		return name
 	}
-	// Field names in C live in a separate namespace, but keywords still break.
 	r := []rune(name)
 	if unicode.IsDigit(r[0]) {
 		return "_" + name

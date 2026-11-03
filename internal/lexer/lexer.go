@@ -252,6 +252,8 @@ func (l *Lexer) Tokens() []token.Token {
 				tt = token.DOT
 			case ';':
 				tt = token.SEMI
+			case '?':
+				tt = token.QUESTION
 			default:
 				tt = token.ILLEGAL
 			}

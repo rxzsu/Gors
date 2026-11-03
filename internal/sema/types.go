@@ -40,6 +40,18 @@ func (t *Ptr) String() string {
 	return "&" + t.Elem.String()
 }
 
+// OptionT is Option<T>.
+type OptionT struct{ Elem Type }
+
+func (t *OptionT) String() string { return "Option<" + t.Elem.String() + ">" }
+
+// ResultT is Result<T, E>.
+type ResultT struct{ Ok, Err Type }
+
+func (t *ResultT) String() string {
+	return "Result<" + t.Ok.String() + ", " + t.Err.String() + ">"
+}
+
 // Slice is []T.
 type Slice struct{ Elem Type }
 
@@ -103,6 +115,8 @@ type Info struct {
 	Methods map[string]map[string]*FuncSig
 	// MethodSel marks Field expressions that resolve to a method.
 	MethodSel map[ast.Expr]bool
-	ExprTypes map[ast.Expr]Type
-	LetTypes  map[*ast.LetStmt]Type
+	// IfLetTypes holds the type bound by `if let PATTERN = expr`.
+	IfLetTypes map[*ast.IfLetStmt]Type
+	ExprTypes  map[ast.Expr]Type
+	LetTypes   map[*ast.LetStmt]Type
 }
