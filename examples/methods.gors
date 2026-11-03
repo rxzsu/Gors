@@ -1,0 +1,21 @@
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn (p: &Point) dist2() -> int {
+    return p.x * p.x + p.y * p.y
+}
+
+fn (p: &mut Point) shift(dx: int, dy: int) {
+    p.x = p.x + dx
+    p.y = p.y + dy
+}
+
+fn main() {
+    let mut p = Point { x: 3, y: 4 }
+    println(p.dist2())
+    p.shift(1, 1)
+    println(p.x)
+    println(p.y)
+}

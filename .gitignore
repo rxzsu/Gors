@@ -1,0 +1,4 @@
+gors.exe
+*.exe
+*.o
+.workbuddy-ai/
