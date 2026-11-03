@@ -130,6 +130,10 @@ func (b *borrowChecker) numberExpr(e ast.Expr) {
 		for _, fi := range ex.Fields {
 			b.numberExpr(fi.Value)
 		}
+	case *ast.SliceLit:
+		for _, e := range ex.Elems {
+			b.numberExpr(e)
+		}
 	case *ast.TryExpr:
 		b.numberExpr(ex.X)
 	case *ast.AddrOf:
@@ -438,6 +442,11 @@ func (b *borrowChecker) checkExpr(e ast.Expr, moveCtx bool) {
 		b.checkPlace(ex.X)
 		b.newBorrow(ex, "")
 
+	case *ast.SliceLit:
+		for _, e := range ex.Elems {
+			b.checkExpr(e, true)
+		}
+
 	case *ast.TryExpr:
 		b.checkExpr(ex.X, true)
 
@@ -452,6 +461,17 @@ func (b *borrowChecker) checkCall(c *ast.Call) {
 		case "Some", "Ok", "Err":
 			for _, a := range c.Args {
 				b.checkExpr(a, true)
+			}
+			return
+		case "push":
+			if len(c.Args) == 2 {
+				if addr, ok := c.Args[0].(*ast.AddrOf); ok {
+					b.checkPlace(addr.X)
+					b.borrowPlace(addr.X, true, addr.At, "")
+				} else {
+					b.checkExpr(c.Args[0], false)
+				}
+				b.checkExpr(c.Args[1], true)
 			}
 			return
 		}

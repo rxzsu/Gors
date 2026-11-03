@@ -446,6 +446,17 @@ func (p *Parser) parsePrimary() ast.Expr {
 			return p.parseStructLit(t)
 		}
 		return &ast.Ident{Name: t.Lit, At: t.Pos}
+	case token.LBRACK:
+		start := p.advance()
+		lit := &ast.SliceLit{At: start.Pos}
+		for !p.check(token.RBRACK) && !p.check(token.EOF) {
+			lit.Elems = append(lit.Elems, p.parseExpr())
+			if !p.accept(token.COMMA) {
+				break
+			}
+		}
+		p.expect(token.RBRACK)
+		return lit
 	case token.LPAREN:
 		p.advance()
 		x := p.parseExpr()

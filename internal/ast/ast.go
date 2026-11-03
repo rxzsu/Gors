@@ -122,6 +122,12 @@ type TryExpr struct {
 	At token.Pos
 }
 
+// SliceLit is [a, b, c].
+type SliceLit struct {
+	Elems []Expr
+	At    token.Pos
+}
+
 // AddrOf is &x or &mut x.
 type AddrOf struct {
 	X   Expr
@@ -140,6 +146,7 @@ func (e *Call) expr()      {}
 func (e *Field) expr()     {}
 func (e *Index) expr()     {}
 func (e *StructLit) expr() {}
+func (e *SliceLit) expr()  {}
 func (e *TryExpr) expr()   {}
 func (e *AddrOf) expr()    {}
 
@@ -154,6 +161,7 @@ func (e *Call) Pos() token.Pos      { return e.At }
 func (e *Field) Pos() token.Pos     { return e.At }
 func (e *Index) Pos() token.Pos     { return e.At }
 func (e *StructLit) Pos() token.Pos { return e.At }
+func (e *SliceLit) Pos() token.Pos  { return e.At }
 func (e *TryExpr) Pos() token.Pos   { return e.At }
 func (e *AddrOf) Pos() token.Pos    { return e.At }
 

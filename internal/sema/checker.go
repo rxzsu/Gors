@@ -447,6 +447,14 @@ func (c *checker) checkExprExpected(e ast.Expr, expected Type) Type {
 		c.errf("E150", id.At, "cannot infer the type of None; annotate it as Option<T>")
 		return nil
 	}
+	if lit, ok := e.(*ast.SliceLit); ok && len(lit.Elems) == 0 {
+		if sl, isSlice := expected.(*Slice); isSlice {
+			c.info.ExprTypes[e] = sl
+			return sl
+		}
+		c.errf("E153", lit.At, "cannot infer the element type of an empty slice literal; annotate it as []T")
+		return nil
+	}
 	if call, ok := e.(*ast.Call); ok {
 		if id, ok := call.Fn.(*ast.Ident); ok && (id.Name == "Ok" || id.Name == "Err") {
 			rt, isRes := expected.(*ResultT)
@@ -680,6 +688,30 @@ func (c *checker) expr(e ast.Expr) Type {
 	case *ast.Call:
 		return c.checkCall(ex)
 
+	case *ast.SliceLit:
+		if len(ex.Elems) == 0 {
+			c.errf("E153", ex.At, "cannot infer the element type of an empty slice literal; annotate it as []T")
+			return nil
+		}
+		var elem Type
+		for i, e := range ex.Elems {
+			t := c.checkExpr(e)
+			if t == nil {
+				continue
+			}
+			if elem == nil {
+				elem = t
+				continue
+			}
+			if !assignable(elem, t) {
+				c.errf("E154", e.Pos(), "slice element %d has type %s, expected %s", i+1, t.String(), elem.String())
+			}
+		}
+		if elem == nil {
+			return nil
+		}
+		return &Slice{Elem: elem}
+
 	case *ast.Index:
 		xt := c.checkExpr(ex.X)
 		if xt == nil {
@@ -755,6 +787,31 @@ func (c *checker) checkCall(ex *ast.Call) Type {
 				c.checkExpr(a)
 			}
 			return VoidT
+		case "push":
+			if len(ex.Args) != 2 {
+				c.errf("E155", ex.At, "push takes exactly two arguments: push(&mut xs, value)")
+				return VoidT
+			}
+			at := c.checkExpr(ex.Args[0])
+			if at == nil {
+				return VoidT
+			}
+			ptr, ok := at.(*Ptr)
+			if !ok || !ptr.Mut {
+				c.errf("E156", ex.Args[0].Pos(), "push requires &mut []T as its first argument")
+				return VoidT
+			}
+			sl, ok := ptr.Elem.(*Slice)
+			if !ok {
+				c.errf("E156", ex.Args[0].Pos(), "push requires &mut []T, got %s", at.String())
+				return VoidT
+			}
+			vt := c.checkExprExpected(ex.Args[1], sl.Elem)
+			if vt != nil && !assignable(sl.Elem, vt) {
+				c.errf("E157", ex.Args[1].Pos(), "cannot push %s into []%s", vt.String(), sl.Elem.String())
+			}
+			return VoidT
+
 		case "len":
 			if len(ex.Args) != 1 {
 				c.errf("E133", ex.At, "len takes exactly one argument")

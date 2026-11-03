@@ -22,6 +22,7 @@ func MonoTypes(info *Info) []Type {
 			add(tt.Elem)
 		case *Slice:
 			add(tt.Elem)
+			seen[MonoName(tt)] = tt
 		}
 	}
 
@@ -83,7 +84,7 @@ func MonoName(t Type) string {
 	case *Ptr:
 		return "ref_" + MonoName(tt.Elem)
 	case *Slice:
-		return "slice_" + MonoName(tt.Elem)
+		return "Slice_" + MonoName(tt.Elem)
 	case *OptionT:
 		return "Option_" + MonoName(tt.Elem)
 	case *ResultT:

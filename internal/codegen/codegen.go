@@ -179,6 +179,10 @@ func (g *gen) resolveType(te ast.TypeExpr) (sema.Type, bool) {
 		if e, ok := g.resolveType(t.Elem); ok {
 			return &sema.Ptr{Elem: e, Mut: t.Mut}, true
 		}
+	case *ast.SliceType:
+		if e, ok := g.resolveType(t.Elem); ok {
+			return &sema.Slice{Elem: e}, true
+		}
 	}
 	return nil, false
 }
@@ -440,6 +444,9 @@ func (g *gen) expr(e ast.Expr) string {
 		}
 		return mangle(ex.Type) + "{" + strings.Join(parts, ", ") + "}"
 
+	case *ast.SliceLit:
+		return g.sliceLit(ex)
+
 	case *ast.TryExpr:
 		return g.lowerTry(ex)
 
@@ -472,10 +479,35 @@ func (g *gen) call(ex *ast.Call) string {
 		case "print":
 			return "fmt.Print(" + g.printArgs(ex.Args) + ")"
 		case "len":
-			return "len(" + g.args(ex.Args) + ")"
+			if len(ex.Args) == 1 {
+				if _, isSlice := g.info.ExprTypes[ex.Args[0]].(*sema.Slice); isSlice {
+					return "int64(len(" + g.expr(ex.Args[0]) + "))"
+				}
+			}
+			return "int64(len(" + g.args(ex.Args) + "))"
+		case "push":
+			if len(ex.Args) == 2 {
+				if addr, ok := ex.Args[0].(*ast.AddrOf); ok {
+					target := g.expr(addr.X)
+					return target + " = append(" + target + ", " + g.expr(ex.Args[1]) + ")"
+				}
+			}
+			return "/* push */"
 		}
 	}
 	return g.expr(ex.Fn) + "(" + g.args(ex.Args) + ")"
+}
+
+func (g *gen) sliceLit(ex *ast.SliceLit) string {
+	sl, ok := g.info.ExprTypes[ex].(*sema.Slice)
+	if !ok {
+		return "nil"
+	}
+	var parts []string
+	for _, e := range ex.Elems {
+		parts = append(parts, g.expr(e))
+	}
+	return "[]" + goType(sl.Elem) + "{" + strings.Join(parts, ", ") + "}"
 }
 
 // lowerTry turns `expr?` into statements plus a value reference.

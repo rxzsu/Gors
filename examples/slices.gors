@@ -1,0 +1,24 @@
+fn sum(xs: []int) -> int {
+    let mut i = 0
+    let mut total = 0
+    while i < len(xs) {
+        total = total + xs[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4]
+    println(len(xs))
+    println(sum(xs))
+
+    let mut ys = [10, 20]
+    push(&mut ys, 30)
+    push(&mut ys, 40)
+    println(len(ys))
+    println(ys[3])
+
+    ys[0] = 99
+    println(ys[0])
+}

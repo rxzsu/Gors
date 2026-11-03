@@ -62,6 +62,28 @@ func TestCompiles(t *testing.T) {
 				let r = twice("x")
 				if let Ok(v) = r { println(v) }
 			}`,
+		"slices": `fn sum(xs: []int) -> int {
+				let mut i = 0
+				let mut total = 0
+				while i < len(xs) {
+					total = total + xs[i]
+					i = i + 1
+				}
+				return total
+			}
+			fn main() {
+				let xs = [1, 2, 3, 4]
+				println(len(xs))
+				println(sum(xs))
+				let mut ys = [10, 20]
+				push(&mut ys, 30)
+				ys[0] = 99
+				println(ys[0])
+			}`,
+		"empty slice": `fn main() {
+				let xs: []int = []
+				println(len(xs))
+			}`,
 		"while": `fn main() {
 			let mut i = 0
 			while i < 3 {
@@ -275,6 +297,46 @@ func TestRejects(t *testing.T) {
 					println(a)
 				}`,
 			code: "E200",
+		},
+		{
+			name: "empty slice without type",
+			src: `fn main() {
+					let xs = []
+					println(1)
+				}`,
+			code: "E153",
+		},
+		{
+			name: "mixed slice elements",
+			src: `fn main() {
+					let xs = [1, "two"]
+					println(1)
+				}`,
+			code: "E154",
+		},
+		{
+			name: "push arity",
+			src: `fn main() {
+					let mut xs = [1]
+					push(&mut xs)
+				}`,
+			code: "E155",
+		},
+		{
+			name: "push without &mut",
+			src: `fn main() {
+					let mut xs = [1]
+					push(xs, 2)
+				}`,
+			code: "E156",
+		},
+		{
+			name: "push wrong element type",
+			src: `fn main() {
+					let mut xs = [1]
+					push(&mut xs, "two")
+				}`,
+			code: "E157",
 		},
 		{
 			name: "immutable &mut",

@@ -23,6 +23,24 @@ const prelude = `#include <stdio.h>
 
 typedef const char* gors_str;
 
+static inline void gors_bounds(int64_t i, int64_t n) {
+    if (i < 0 || i >= n) {
+        fprintf(stderr, "gors: index %lld out of bounds (len %lld)\n",
+                (long long)i, (long long)n);
+        exit(1);
+    }
+}
+
+#define GORS_AT(s, i) (gors_bounds((i), (s).len), (s).data[(i)])
+
+static void* gors_dup(const void* src, int64_t n, size_t elem) {
+    size_t bytes = (size_t)n * elem;
+    void* out = malloc(bytes ? bytes : 1);
+    if (!out) { fputs("gors: out of memory\n", stderr); exit(1); }
+    if (bytes) memcpy(out, src, bytes);
+    return out;
+}
+
 [[maybe_unused]] static gors_str gors_concat(gors_str a, gors_str b) {
     size_t la = strlen(a), lb = strlen(b);
     char* out = (char*)malloc(la + lb + 1);
@@ -125,6 +143,24 @@ func (g *gen) genMono(t sema.Type) {
 	case *sema.ResultT:
 		g.line("typedef struct %s { bool ok; %s val; %s err; } %s;",
 			name, cType(tt.Ok), cType(tt.Err), name)
+	case *sema.Slice:
+		elem := cType(tt.Elem)
+		g.line("typedef struct %s { %s* data; int64_t len; int64_t cap; } %s;",
+			name, elem, name)
+		g.line("[[maybe_unused]] static void %s_push(%s* s, %s v) {", name, name, elem)
+		g.ind++
+		g.line("if (s->len == s->cap) {")
+		g.ind++
+		g.line("int64_t nc = s->cap ? s->cap * 2 : 4;")
+		g.line("%s* nd = (%s*)realloc(s->data, (size_t)nc * sizeof(%s));", elem, elem, elem)
+		g.line("if (!nd) { fputs(\"gors: out of memory\\n\", stderr); exit(1); }")
+		g.line("s->data = nd;")
+		g.line("s->cap = nc;")
+		g.ind--
+		g.line("}")
+		g.line("s->data[s->len++] = v;")
+		g.ind--
+		g.line("}")
 	}
 }
 
@@ -166,6 +202,10 @@ func (g *gen) resolveType(te ast.TypeExpr) (sema.Type, bool) {
 	case *ast.PtrType:
 		if e, ok := g.resolveType(t.Elem); ok {
 			return &sema.Ptr{Elem: e, Mut: t.Mut}, true
+		}
+	case *ast.SliceType:
+		if e, ok := g.resolveType(t.Elem); ok {
+			return &sema.Slice{Elem: e}, true
 		}
 	}
 	return nil, false
@@ -262,6 +302,13 @@ func (g *gen) genStmt(s ast.Stmt) {
 		g.line("%s %s = %s;", ct, mangle(st.Name), g.expr(st.Value))
 
 	case *ast.AssignStmt:
+		if idx, ok := st.Target.(*ast.Index); ok {
+			base := g.expr(idx.X)
+			i := g.expr(idx.Idx)
+			g.line("gors_bounds(%s, (%s).len);", i, base)
+			g.line("(%s).data[%s] = %s;", base, i, g.expr(st.Value))
+			return
+		}
 		g.line("%s = %s;", g.expr(st.Target), g.expr(st.Value))
 
 	case *ast.ExprStmt:
@@ -428,6 +475,9 @@ func (g *gen) expr(e ast.Expr) string {
 		return g.expr(ex.X) + sep + mangle(ex.Name)
 
 	case *ast.Index:
+		if _, isSlice := g.info.ExprTypes[ex.X].(*sema.Slice); isSlice {
+			return "GORS_AT(" + g.expr(ex.X) + ", " + g.expr(ex.Idx) + ")"
+		}
 		return g.expr(ex.X) + "[" + g.expr(ex.Idx) + "]"
 
 	case *ast.StructLit:
@@ -436,6 +486,9 @@ func (g *gen) expr(e ast.Expr) string {
 			parts = append(parts, "."+mangle(fi.Name)+" = "+g.expr(fi.Value))
 		}
 		return "(" + mangle(ex.Type) + "){ " + strings.Join(parts, ", ") + " }"
+
+	case *ast.SliceLit:
+		return g.sliceLit(ex)
 
 	case *ast.TryExpr:
 		return g.lowerTry(ex)
@@ -469,13 +522,46 @@ func (g *gen) call(ex *ast.Call) string {
 		case "print":
 			return g.printCall(ex.Args, false)
 		case "len":
+			if len(ex.Args) == 1 {
+				if _, isSlice := g.info.ExprTypes[ex.Args[0]].(*sema.Slice); isSlice {
+					return "(" + g.expr(ex.Args[0]) + ").len"
+				}
+			}
 			return "strlen(" + g.args(ex.Args) + ")"
+		case "push":
+			if len(ex.Args) == 2 {
+				if addr, ok := ex.Args[0].(*ast.AddrOf); ok {
+					if sl, ok := g.info.ExprTypes[addr.X].(*sema.Slice); ok {
+						return sema.MonoName(sl) + "_push(&" + g.expr(addr.X) + ", " + g.expr(ex.Args[1]) + ")"
+					}
+				}
+			}
+			return "0"
 		}
 	}
 	if field, ok := ex.Fn.(*ast.Field); ok && g.info.MethodSel[field] {
 		return g.methodCall(ex, field)
 	}
 	return mangle(callName(ex.Fn)) + "(" + g.args(ex.Args) + ")"
+}
+
+func (g *gen) sliceLit(ex *ast.SliceLit) string {
+	sl, ok := g.info.ExprTypes[ex].(*sema.Slice)
+	if !ok {
+		return "0"
+	}
+	name := sema.MonoName(sl)
+	if len(ex.Elems) == 0 {
+		return "(" + name + "){0}"
+	}
+	var parts []string
+	for _, e := range ex.Elems {
+		parts = append(parts, g.expr(e))
+	}
+	n := strconv.Itoa(len(ex.Elems))
+	elem := cType(sl.Elem)
+	return "(" + name + "){ .data = (" + elem + "*)gors_dup((" + elem + "[]){" +
+		strings.Join(parts, ", ") + "}, " + n + ", sizeof(" + elem + ")), .len = " + n + ", .cap = " + n + " }"
 }
 
 // lowerTry turns `expr?` into statements plus a value reference.
@@ -605,7 +691,7 @@ func (g *gen) isVoidCall(e ast.Expr) bool {
 	}
 	if id, ok := call.Fn.(*ast.Ident); ok {
 		switch id.Name {
-		case "println", "print":
+		case "println", "print", "push":
 			return true
 		}
 		if sig, ok := g.info.Funcs[id.Name]; ok {
@@ -640,7 +726,7 @@ func (g *gen) typeOf(te ast.TypeExpr) string {
 	case *ast.PtrType:
 		return g.typeOf(t.Elem) + "*"
 	case *ast.SliceType:
-		return g.typeOf(t.Elem) + "*"
+		return sema.MonoName(&sema.Slice{Elem: &sema.Basic{Name: "int"}})
 	}
 	return "void"
 }
@@ -663,7 +749,7 @@ func cType(t sema.Type) string {
 	case *sema.Ptr:
 		return cType(tt.Elem) + "*"
 	case *sema.Slice:
-		return cType(tt.Elem) + "*"
+		return sema.MonoName(tt)
 	case *sema.OptionT, *sema.ResultT:
 		return sema.MonoName(tt)
 	}
