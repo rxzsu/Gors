@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        default: v0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Validate version tag
+        shell: bash
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+      - name: Install C23 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
+      - name: Verify tag and compiler version
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(go run ./cmd/gors --version)" = "GoRs ${RELEASE_TAG#v}"
+      - name: Test both backends
+        run: |
+          go test -count=1 ./...
+          go vet ./...
+      - name: Build Linux and Windows archives
+        run: |
+          go run ./tools/package -out dist
+          cd dist
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gors-${{ env.RELEASE_TAG }}
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload archives to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "GoRs $RELEASE_TAG" --notes-file CHANGELOG.md
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
