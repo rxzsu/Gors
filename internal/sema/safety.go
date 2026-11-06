@@ -2,8 +2,8 @@ package sema
 
 import "gors/internal/ast"
 
-// References are local borrows or parameters in v0.1, never stored in aggregates
-// or returned. This deliberately avoids claiming an unimplemented lifetime system.
+// References cannot be stored in aggregates in v0.1. Returning a reference
+// derived from an input reference is checked separately by lifetime elision.
 func containsRef(t Type) bool {
 	switch t := t.(type) {
 	case *Ptr:

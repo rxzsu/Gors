@@ -54,7 +54,11 @@ const (
 	MUT    Type = "mut"
 	IF     Type = "if"
 	ELSE   Type = "else"
-	WHILE  Type = "while"
+	WHILE    Type = "while"
+	FOR      Type = "for"
+	IN       Type = "in"
+	BREAK    Type = "break"
+	CONTINUE Type = "continue"
 	RETURN Type = "return"
 	STRUCT Type = "struct"
 	TRUE   Type = "true"
@@ -82,7 +86,11 @@ var keywords = map[string]Type{
 	"mut":    MUT,
 	"if":     IF,
 	"else":   ELSE,
-	"while":  WHILE,
+	"while":    WHILE,
+	"for":      FOR,
+	"in":       IN,
+	"break":    BREAK,
+	"continue": CONTINUE,
 	"return": RETURN,
 	"struct": STRUCT,
 	"true":   TRUE,

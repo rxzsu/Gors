@@ -69,6 +69,81 @@ func TestBackendExecution(t *testing.T) {
  fn outer() -> Result<string, string> { return Ok(combine(value(1), inner()?)) }
  fn main() { if let Ok(s) = outer() { println(s) } }`, "1\n2\nxy\n", false},
 		{"main return", `fn main() { let s = "cleanup"; println(s); return }`, "cleanup\n", false},
+		{"break loop", `fn main() {
+ let mut i = 0
+ while true {
+     let temp = "owned string " + "in loop"
+     if i == 3 {
+         break
+     }
+     i = i + 1
+ }
+ println(i)
+}`, "3\n", false},
+		{"continue loop", `fn main() {
+ let mut i = 0
+ let mut sum = 0
+ while i < 5 {
+     i = i + 1
+     let s = "item"
+     if i % 2 == 0 {
+         continue
+     }
+     sum = sum + i
+ }
+ println(sum)
+}`, "9\n", false},
+		{"for slice", `fn main() {
+ let xs = [1, 2, 3]
+ let mut sum = 0
+ for x in xs {
+     sum = sum + x
+ }
+ println(sum)
+}`, "6\n", false},
+		{"for index and temp", `fn main() {
+ for i, s in ["a", "b"] {
+     println(i)
+     println(s)
+ }
+}`, "0\na\n1\nb\n", false},
+		{"for break continue", `fn main() {
+ let xs = [10, 20, 30, 40]
+ for i, x in xs {
+     if i == 0 { continue }
+     if x > 30 { break }
+     println(x)
+ }
+}`, "20\n30\n", false},
+		{"subslice copy", `fn main() {
+ let xs = [1, 2, 3, 4, 5]
+ let s = xs[1:4]
+ println(len(s))
+ println(s[0])
+ println(s[2])
+}`, "3\n2\n4\n", false},
+		{"subslice independent storage", `fn main() {
+ let mut xs = [1, 2, 3]
+ let mut ys = xs[0:2]
+ ys[0] = 9
+ xs[1] = 8
+ push(&mut ys, 7)
+ println(xs[0]); println(ys[1]); println(xs[2]); println(len(ys))
+}`, "1\n2\n3\n3\n", false},
+		{"subslice reference and empty", `fn main() {
+ let xs = [1, 2, 3]
+ let r = &xs
+ let ys = r[1:]
+ println(ys[0]); println(len(xs[3:])); println(len(xs[:0]))
+ let empty: []int = []
+ println(len(empty[:]))
+}`, "2\n0\n0\n0\n", false},
+		{"string slice", `fn main() {
+ let s = "abcdef"
+ println(s[:3])
+ println(s[3:])
+ println(s[2:4])
+}`, "abc\ndef\ncd\n", false},
 		{"conditional try owner", `fn work() -> Result<string, string> {
  let result: Result<string, string> = Ok("retained"); if false { let value = result?; println(value) }; return Ok("done") }
  fn main() { if let Ok(s) = work() { println(s) } }`, "done\n", false},
@@ -81,6 +156,55 @@ func TestBackendExecution(t *testing.T) {
  fn consume(ok: bool) -> string { match choose(ok) { Err(e) => { return e }, Ok(v) => { return v } } }
  fn main() { println(consume(true)); println(consume(false)) }`, "yes\nno\n", false},
 		{"match wildcard binding", `fn main() { match Some("drop") { Some(_) => {}, None => {} }; let r: Result<string,string> = Err("drop"); match r { Ok(_) => {}, Err(_) => {} } }`, "", false},
+		{"match as expression", `fn describe(o: Option<int>) -> string {
+	return match o {
+		Some(v) => "value",
+		None => "empty",
+	};
+}
+fn main() {
+	let a: Option<int> = Some(10);
+	let x = match a {
+		Some(v) => v + 5,
+		None => 0,
+	};
+	println(x);
+	let b: Option<int> = None;
+	let y = match b {
+		Some(v) => v + 5,
+		None => 42,
+	};
+	println(y);
+	println(describe(Some(10)));
+	println(describe(None));
+	let r: Result<string, string> = Ok("success");
+	let msg = match r {
+		Ok(v) => { println("got ok"); v + "!" },
+		Err(e) => e,
+	};
+	println(msg);
+}`, "15\n42\nvalue\nempty\ngot ok\nsuccess!\n", false},
+		{"lifetime elision references", `struct Point { x: int, y: int }
+fn (p: &Point) get_x() -> &int {
+	return &p.x;
+}
+fn (p: &mut Point) x_mut() -> &mut int {
+	return &mut p.x;
+}
+fn first(xs: &[]int) -> &int {
+	return &xs[0];
+}
+fn main() {
+	let mut pt = Point { x: 10, y: 20 };
+	println(*pt.get_x());
+	let rx = pt.get_x();
+	println(*rx);
+	let rx_mut = pt.x_mut();
+	*rx_mut = 99;
+	println(pt.x);
+	let list = [100, 200, 300];
+	println(*first(&list));
+}`, "10\n10\n99\n100\n", false},
 		{"file modules", "@file:../../examples/modules/main.gors", "25\nhello\n", false},
 		{"discard values", `fn main(){let _="a";let _="b";if let Some(_)=Some("c"){};match Some("d"){Some(_)=>{} None=>{}}}`, "", false},
 		{"push reference", `fn add(xs:&mut []string){push(xs,"two")} fn main(){let mut xs=["one"];add(&mut xs);println(xs[1])}`, "two\n", false},
@@ -94,7 +218,11 @@ func TestBackendExecution(t *testing.T) {
 		{"method symbol names", `struct A_B{x:int} struct A{x:int}
  fn(a:&A_B)C()->int{return a.x} fn(a:&A)B_C()->int{return a.x}
  fn main(){let a=A_B{x:1};let b=A{x:2};println(a.C());println(b.B_C())}`, "1\n2\n", false},
-		{"bounds", `fn main() { let xs = [1]; println(xs[2]) }`, "", true},
+		{"bounds", `fn main() { let xs = [1]; println(xs[2]) }`, "gors: index 2 out of bounds (len 1)\n", true},
+		{"slice negative bound", `fn main() { let xs = [1, 2]; println(len(xs[-1:1])) }`, "gors: slice bounds out of range [-1:1] (len 2)\n", true},
+		{"slice reversed bounds", `fn main() { let xs = [1, 2]; println(len(xs[2:1])) }`, "gors: slice bounds out of range [2:1] (len 2)\n", true},
+		{"slice past length", `fn main() { let xs = [1, 2]; println(len(xs[:3])) }`, "gors: slice bounds out of range [0:3] (len 2)\n", true},
+		{"string slice bounds", `fn main() { println("ab"[0:3]) }`, "gors: slice bounds out of range [0:3] (len 2)\n", true},
 	}
 	for _, ex := range []struct{ name, want string }{
 		{"hello", "hello from GoRs\n"}, {"structs", "25\n4\n5\n"}, {"methods", "25\n4\n5\n"},
@@ -195,14 +323,18 @@ func TestBackendExecution(t *testing.T) {
 						if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
 							t.Fatalf("expected nonzero exit, got %v", err)
 						}
-						if stderrText != "gors: index 2 out of bounds (len 1)\n" {
+						if stderrText != tc.want {
 							t.Fatalf("unexpected failure: %s", stderr.String())
 						}
 					} else if err != nil {
 						t.Fatalf("run: %v\n%s", err, stderr.String())
 					}
-					if stdoutText != tc.want {
-						t.Fatalf("stdout %q, want %q", stdout.String(), tc.want)
+					wantStdout := tc.want
+					if tc.fails {
+						wantStdout = ""
+					}
+					if stdoutText != wantStdout {
+						t.Fatalf("stdout %q, want %q", stdout.String(), wantStdout)
 					}
 					if !tc.fails && stderr.Len() != 0 {
 						t.Fatalf("unexpected stderr (including leak report): %s", stderr.String())

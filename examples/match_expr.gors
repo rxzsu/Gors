@@ -1,0 +1,39 @@
+fn status_code(res: Result<int, string>) -> int {
+    return match res {
+        Ok(code) => code,
+        Err(msg) => {
+            println("error occurred: " + msg);
+            500
+        },
+    };
+}
+
+fn describe_opt(opt: Option<string>) -> string {
+    return match opt {
+        Some(v) => "value: " + v,
+        None => "empty",
+    };
+}
+
+fn main() {
+    let ok_res: Result<int, string> = Ok(200);
+    let code1 = status_code(ok_res);
+    println("status 1:", code1);
+
+    let err_res: Result<int, string> = Err("database connection failed");
+    let code2 = status_code(err_res);
+    println("status 2:", code2);
+
+    let opt1: Option<string> = Some("hello");
+    println(describe_opt(opt1));
+
+    let opt2: Option<string> = None;
+    println(describe_opt(opt2));
+
+    let num: Option<int> = Some(42);
+    let doubled = match num {
+        Some(n) => n * 2,
+        None => 0,
+    };
+    println("doubled:", doubled);
+}

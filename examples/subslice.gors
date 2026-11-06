@@ -1,0 +1,34 @@
+fn main() {
+    let numbers = [10, 20, 30, 40, 50]
+
+    println("Full slice len:")
+    println(len(numbers))
+
+    let sub = numbers[1:4]
+    println("Subslice [1:4] len:")
+    println(len(sub))
+    for n in sub {
+        println(n)
+    }
+
+    let head = numbers[:2]
+    println("Head [:2] len:")
+    println(len(head))
+    for n in head {
+        println(n)
+    }
+
+    let tail = numbers[3:]
+    println("Tail [3:] len:")
+    println(len(tail))
+    for n in tail {
+        println(n)
+    }
+
+    let greeting = "Hello, GoRs!"
+    let prefix = greeting[0:5]
+    println(prefix)
+
+    let suffix = greeting[7:]
+    println(suffix)
+}

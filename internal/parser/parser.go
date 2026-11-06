@@ -265,6 +265,14 @@ func (p *Parser) parseStmt() ast.Stmt {
 		return p.parseIf()
 	case token.WHILE:
 		return p.parseWhile()
+	case token.FOR:
+		return p.parseFor()
+	case token.BREAK:
+		start := p.advance()
+		return &ast.BreakStmt{At: start.Pos}
+	case token.CONTINUE:
+		start := p.advance()
+		return &ast.ContinueStmt{At: start.Pos}
 	case token.RETURN:
 		return p.parseReturn()
 	case token.LBRACE:
@@ -331,6 +339,31 @@ func (p *Parser) parseWhile() ast.Stmt {
 	p.noStructLit--
 	body := p.parseBlock()
 	return &ast.WhileStmt{Cond: cond, Body: body, At: start.Pos}
+}
+
+func (p *Parser) parseFor() ast.Stmt {
+	start := p.expect(token.FOR)
+	first := p.expect(token.IDENT)
+	var key, val string
+	if p.accept(token.COMMA) {
+		second := p.expect(token.IDENT)
+		key = first.Lit
+		val = second.Lit
+	} else {
+		val = first.Lit
+	}
+	p.expect(token.IN)
+	p.noStructLit++
+	iter := p.parseExpr()
+	p.noStructLit--
+	body := p.parseBlock()
+	return &ast.ForStmt{
+		Key:   key,
+		Value: val,
+		Iter:  iter,
+		Body:  body,
+		At:    start.Pos,
+	}
 }
 
 func (p *Parser) parseReturn() ast.Stmt {
@@ -423,6 +456,8 @@ func (p *Parser) parseUnary() ast.Expr {
 		return &ast.Unary{Op: "-", X: p.parseUnary(), At: t.Pos}
 	case p.accept(token.NOT):
 		return &ast.Unary{Op: "!", X: p.parseUnary(), At: t.Pos}
+	case p.accept(token.STAR):
+		return &ast.Unary{Op: "*", X: p.parseUnary(), At: t.Pos}
 	case p.accept(token.AMP):
 		mut := p.accept(token.MUT)
 		return &ast.AddrOf{X: p.parseUnary(), Mut: mut, At: t.Pos}
@@ -452,9 +487,27 @@ func (p *Parser) parsePostfix() ast.Expr {
 			x = &ast.Field{X: x, Name: name.Lit, At: dot.Pos}
 		case p.check(token.LBRACK):
 			start := p.advance()
-			idx := p.parseExpr()
-			p.expect(token.RBRACK)
-			x = &ast.Index{X: x, Idx: idx, At: start.Pos}
+			var low, high ast.Expr
+			if p.accept(token.COLON) {
+				if !p.check(token.RBRACK) {
+					high = p.parseExpr()
+				}
+				p.expect(token.RBRACK)
+				x = &ast.SliceExpr{X: x, Low: low, High: high, At: start.Pos}
+			} else {
+				first := p.parseExpr()
+				if p.accept(token.COLON) {
+					low = first
+					if !p.check(token.RBRACK) {
+						high = p.parseExpr()
+					}
+					p.expect(token.RBRACK)
+					x = &ast.SliceExpr{X: x, Low: low, High: high, At: start.Pos}
+				} else {
+					p.expect(token.RBRACK)
+					x = &ast.Index{X: x, Idx: first, At: start.Pos}
+				}
+			}
 		case p.check(token.QUESTION):
 			q := p.advance()
 			x = &ast.TryExpr{X: x, At: q.Pos}
@@ -515,6 +568,8 @@ func (p *Parser) parsePrimary() ast.Expr {
 		x := p.parseExpr()
 		p.expect(token.RPAREN)
 		return x
+	case token.MATCH:
+		return p.parseMatchExpr()
 	default:
 		p.errorf(t.Pos, "unexpected token %q in expression", t.Type)
 		p.advance()
@@ -538,13 +593,9 @@ func (p *Parser) parseStructLit(name token.Token) ast.Expr {
 	return lit
 }
 
-func (p *Parser) parseMatch() ast.Stmt {
-	start := p.expect(token.MATCH)
-	p.noStructLit++
-	value := p.parseExpr()
-	p.noStructLit--
-	st := &ast.MatchStmt{Value: value, At: start.Pos}
+func (p *Parser) parseMatchArms() []*ast.MatchArm {
 	p.expect(token.LBRACE)
+	var arms []*ast.MatchArm
 	for !p.check(token.RBRACE) && !p.check(token.EOF) {
 		before := p.pos
 		kind := p.expect(token.IDENT)
@@ -554,15 +605,54 @@ func (p *Parser) parseMatch() ast.Stmt {
 			p.expect(token.RPAREN)
 		}
 		p.expect(token.FATARROW)
-		arm.Body = p.parseBlock()
-		st.Arms = append(st.Arms, arm)
+		if p.check(token.LBRACE) {
+			arm.Body = p.parseBlock()
+		} else {
+			arm.Expr = p.parseExpr()
+		}
+		arms = append(arms, arm)
 		p.accept(token.COMMA)
 		if before == p.pos {
 			p.advance()
 		}
 	}
 	p.expect(token.RBRACE)
-	return st
+	return arms
+}
+
+func (p *Parser) parseMatch() ast.Stmt {
+	start := p.expect(token.MATCH)
+	p.noStructLit++
+	value := p.parseExpr()
+	p.noStructLit--
+	arms := p.parseMatchArms()
+	for _, arm := range arms {
+		if arm.Body == nil && arm.Expr != nil {
+			arm.Body = &ast.Block{
+				Stmts: []ast.Stmt{&ast.ExprStmt{X: arm.Expr, At: arm.Expr.Pos()}},
+				At:    arm.Expr.Pos(),
+			}
+			arm.Expr = nil
+		}
+	}
+	return &ast.MatchStmt{Value: value, Arms: arms, At: start.Pos}
+}
+
+func (p *Parser) parseMatchExpr() ast.Expr {
+	start := p.expect(token.MATCH)
+	p.noStructLit++
+	value := p.parseExpr()
+	p.noStructLit--
+	arms := p.parseMatchArms()
+	for _, arm := range arms {
+		if arm.Body != nil && arm.Expr == nil && len(arm.Body.Stmts) > 0 {
+			if es, ok := arm.Body.Stmts[len(arm.Body.Stmts)-1].(*ast.ExprStmt); ok {
+				arm.Expr = es.X
+				arm.Body.Stmts = arm.Body.Stmts[:len(arm.Body.Stmts)-1]
+			}
+		}
+	}
+	return &ast.MatchExpr{Value: value, Arms: arms, At: start.Pos}
 }
 
 func reservedGlobal(name string) bool {

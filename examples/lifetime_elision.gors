@@ -1,0 +1,34 @@
+struct Vector2D {
+    x: int,
+    y: int,
+}
+
+fn (v: &Vector2D) get_x() -> &int {
+    return &v.x;
+}
+
+fn (v: &Vector2D) get_y() -> &int {
+    return &v.y;
+}
+
+fn (v: &mut Vector2D) x_mut() -> &mut int {
+    return &mut v.x;
+}
+
+fn first_element(items: &[]int) -> &int {
+    return &items[0];
+}
+
+fn main() {
+    let mut vec = Vector2D { x: 15, y: 30 };
+    println("initial x:", *vec.get_x());
+    println("initial y:", *vec.get_y());
+
+    let rx = vec.x_mut();
+    *rx = 99;
+    println("modified x:", vec.x);
+
+    let numbers = [100, 200, 300];
+    let head = first_element(&numbers);
+    println("first number:", *head);
+}

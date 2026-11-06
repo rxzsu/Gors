@@ -20,6 +20,7 @@ func Check(prog *ast.Program) (*Info, []*Error) {
 			Moves:      map[ast.Expr]bool{},
 			ExprTypes:  map[ast.Expr]Type{},
 			LetTypes:   map[*ast.LetStmt]Type{},
+			ForTypes:   map[*ast.ForStmt]Type{},
 		},
 	}
 	c.declareStructs(prog)
@@ -39,8 +40,10 @@ type checker struct {
 	errs   []*Error
 	scopes []map[string]*varInfo
 
-	curRet  Type
-	curFunc string
+	curRet         Type
+	curFunc        string
+	curElidedParam string
+	loopDepth      int
 }
 
 type varInfo struct {
@@ -113,8 +116,20 @@ func (c *checker) declareFuncs(prog *ast.Program) {
 				sig.Ret = rt
 			}
 		}
+		sig.ElidedParam = -1
 		if containsRef(sig.Ret) {
-			c.errf("E211", fn.At, "returning references is not supported in v0.1")
+			refCount := 0
+			for i, pt := range sig.Params {
+				if containsRef(pt) {
+					refCount++
+					sig.ElidedParam = i
+				}
+			}
+			if refCount == 0 {
+				c.errf("E211", fn.At, "cannot return reference without an input reference")
+			} else if refCount > 1 {
+				c.errf("E211", fn.At, "ambiguous lifetime: function has %d input references; lifetime annotations not supported", refCount)
+			}
 		}
 		if fn.Name == "main" && (len(sig.Params) != 0 || sig.Ret != VoidT) {
 			c.errf("E117", fn.At, "main must have no parameters and no return type")
@@ -162,8 +177,24 @@ func (c *checker) declareMethod(fn *ast.FuncDecl) {
 			sig.Ret = r
 		}
 	}
+	sig.ElidedParam = -1
 	if containsRef(sig.Ret) {
-		c.errf("E211", fn.At, "returning references is not supported in v0.1")
+		if containsRef(sig.Params[0]) {
+			sig.ElidedParam = 0
+		} else {
+			refCount := 0
+			for i := 1; i < len(sig.Params); i++ {
+				if containsRef(sig.Params[i]) {
+					refCount++
+					sig.ElidedParam = i
+				}
+			}
+			if refCount == 0 {
+				c.errf("E211", fn.At, "cannot return reference without an input reference")
+			} else if refCount > 1 {
+				c.errf("E211", fn.At, "ambiguous lifetime: method has %d input references; lifetime annotations not supported", refCount)
+			}
+		}
 	}
 	c.info.Methods[st.Name][fn.Name] = sig
 }
@@ -303,6 +334,18 @@ func (c *checker) checkFunc(fn *ast.FuncDecl) {
 	}
 	c.curRet = sig.Ret
 	c.curFunc = fn.Name
+	c.curElidedParam = ""
+	if fn.Recv != nil {
+		if sig.ElidedParam == 0 {
+			c.curElidedParam = fn.Recv.Name
+		} else if sig.ElidedParam > 0 && sig.ElidedParam-1 < len(fn.Params) {
+			c.curElidedParam = fn.Params[sig.ElidedParam-1].Name
+		}
+	} else {
+		if sig.ElidedParam >= 0 && sig.ElidedParam < len(fn.Params) {
+			c.curElidedParam = fn.Params[sig.ElidedParam].Name
+		}
+	}
 	c.scopes = nil
 	c.pushScope()
 	if fn.Recv != nil {
@@ -410,6 +453,16 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		if !assignable(c.curRet, vt) {
 			c.errf("E112", st.At, "cannot return %s from function returning %s", vt.String(), c.curRet.String())
 		}
+		if containsRef(c.curRet) {
+			root, ok := rootIdent(st.X)
+			if !ok || root != c.curElidedParam {
+				if ok {
+					c.errf("E211", st.At, "cannot return reference to local variable %q", root)
+				} else {
+					c.errf("E211", st.At, "cannot return reference not derived from parameter %q", c.curElidedParam)
+				}
+			}
+		}
 
 	case *ast.IfStmt:
 		ct := c.checkExpr(st.Cond)
@@ -430,7 +483,61 @@ func (c *checker) checkStmt(s ast.Stmt) {
 				c.errf("E113", st.Cond.Pos(), "while condition must be bool, got %s", ct.String())
 			}
 		}
+		c.loopDepth++
 		c.checkBlock(st.Body)
+		c.loopDepth--
+
+	case *ast.BreakStmt:
+		if c.loopDepth == 0 {
+			c.errf("E180", st.At, "break outside of loop")
+		}
+
+	case *ast.ContinueStmt:
+		if c.loopDepth == 0 {
+			c.errf("E181", st.At, "continue outside of loop")
+		}
+
+	case *ast.ForStmt:
+		it := c.checkExpr(st.Iter)
+		var elemT Type
+		if it != nil {
+			var sl *Slice
+			if s, ok := it.(*Slice); ok {
+				sl = s
+			} else if ptr, ok := it.(*Ptr); ok {
+				if s, ok := ptr.Elem.(*Slice); ok {
+					sl = s
+				}
+			}
+			if sl == nil {
+				c.errf("E182", st.Iter.Pos(), "for loop requires a slice, got %s", it.String())
+			} else {
+				elemT = sl.Elem
+			}
+		}
+
+		c.loopDepth++
+		c.pushScope()
+		if st.Key != "" && st.Key != "_" {
+			if !c.declare(st.Key, &varInfo{Type: Int, Mut: false}) {
+				c.errf("E107", st.At, "%q is already declared in this scope", st.Key)
+			}
+		}
+		if st.Value != "" && st.Value != "_" && elemT != nil {
+			valType := elemT
+			if !IsCopy(elemT) {
+				valType = &Ptr{Elem: elemT, Mut: false}
+			}
+			c.info.ForTypes[st] = valType
+			if !c.declare(st.Value, &varInfo{Type: valType, Mut: false}) {
+				c.errf("E107", st.At, "%q is already declared in this scope", st.Value)
+			}
+		}
+		for _, s := range st.Body.Stmts {
+			c.checkStmt(s)
+		}
+		c.popScope()
+		c.loopDepth--
 
 	case *ast.IfLetStmt:
 		vt := c.checkExpr(st.Value)
@@ -522,9 +629,77 @@ func (c *checker) checkBlockWith(b *ast.Block, name string, t Type) {
 	c.popScope()
 }
 
+func (c *checker) checkMatchExpr(ex *ast.MatchExpr, expected Type) Type {
+	vt := c.checkExpr(ex.Value)
+	if vt == nil {
+		return nil
+	}
+	variants := map[string]Type{}
+	switch t := vt.(type) {
+	case *OptionT:
+		variants["Some"] = t.Elem
+		variants["None"] = nil
+	case *ResultT:
+		variants["Ok"] = t.Ok
+		variants["Err"] = t.Err
+	default:
+		c.errf("E170", ex.At, "match requires Option or Result, got %s", vt.String())
+		return nil
+	}
+	seen := map[string]bool{}
+	var retType Type = expected
+	for _, arm := range ex.Arms {
+		bound, ok := variants[arm.Kind]
+		if !ok {
+			c.errf("E171", arm.At, "pattern %s does not belong to %s", arm.Kind, vt.String())
+			continue
+		}
+		if seen[arm.Kind] {
+			c.errf("E172", arm.At, "duplicate match arm %s", arm.Kind)
+		}
+		seen[arm.Kind] = true
+		if (bound == nil) != (arm.Name == "") {
+			c.errf("E173", arm.At, "pattern %s has an invalid binding", arm.Kind)
+			continue
+		}
+		c.info.MatchTypes[arm] = bound
+		c.pushScope()
+		if bound != nil {
+			c.declare(arm.Name, &varInfo{Type: bound, Mut: false})
+		}
+		if arm.Body != nil {
+			c.checkStatements(arm.Body.Stmts)
+		}
+		var armT Type
+		if arm.Expr != nil {
+			armT = c.checkExprExpected(arm.Expr, retType)
+		}
+		c.popScope()
+		if armT != nil {
+			if retType == nil {
+				retType = armT
+			} else if !assignable(retType, armT) {
+				c.errf("E175", arm.At, "match arm returns %s, expected %s", armT.String(), retType.String())
+			}
+		}
+	}
+	if len(seen) != 2 {
+		c.errf("E174", ex.At, "non-exhaustive match: cover both variants of %s", vt.String())
+	}
+	if retType == nil {
+		c.errf("E175", ex.At, "cannot infer result type of match expression")
+		return nil
+	}
+	c.info.ExprTypes[ex] = retType
+	return retType
+}
+
 // checkExprExpected checks e knowing the type the context expects.
 // It is what makes `None` and `Ok(x)` inferable.
 func (c *checker) checkExprExpected(e ast.Expr, expected Type) Type {
+	if match, ok := e.(*ast.MatchExpr); ok {
+		return c.checkMatchExpr(match, expected)
+	}
 	if expected == nil {
 		return c.checkExpr(e)
 	}
@@ -637,6 +812,12 @@ func (c *checker) expr(e ast.Expr) Type {
 				return nil
 			}
 			return Bool
+		case "*":
+			if p, ok := xt.(*Ptr); ok {
+				return p.Elem
+			}
+			c.errf("E118", ex.At, "cannot dereference non-pointer type %s", xt.String())
+			return nil
 		}
 		return nil
 
@@ -694,12 +875,15 @@ func (c *checker) expr(e ast.Expr) Type {
 		if ex.Mut {
 			root, ok := rootIdent(ex.X)
 			if ok {
-				if v, found := c.lookup(root); found && !v.Mut {
+				if v, found := c.lookup(root); found && !v.Mut && !isMutRef(v.Type) {
 					c.errf("E124", ex.At, "cannot take &mut of immutable %q; declare it with `let mut`", root)
 				}
 			}
 		}
 		return &Ptr{Elem: xt, Mut: ex.Mut}
+
+	case *ast.MatchExpr:
+		return c.checkMatchExpr(ex, nil)
 
 	case *ast.Field:
 		xt := c.checkExpr(ex.X)
@@ -818,10 +1002,51 @@ func (c *checker) expr(e ast.Expr) Type {
 		if it != nil && !isInt(it) {
 			c.errf("E131", ex.At, "index must be int, got %s", it.String())
 		}
-		if sl, ok := xt.(*Slice); ok {
+		base := xt
+		if p, ok := base.(*Ptr); ok {
+			base = p.Elem
+		}
+		if sl, ok := base.(*Slice); ok {
 			return sl.Elem
 		}
 		c.errf("E132", ex.At, "type %s is not indexable", xt.String())
+		return nil
+
+	case *ast.SliceExpr:
+		xt := c.checkExpr(ex.X)
+		if xt == nil {
+			return nil
+		}
+		if ex.Low != nil {
+			lt := c.checkExpr(ex.Low)
+			if lt != nil && !isInt(lt) {
+				c.errf("E131", ex.Low.Pos(), "slice low index must be int, got %s", lt.String())
+			}
+		}
+		if ex.High != nil {
+			ht := c.checkExpr(ex.High)
+			if ht != nil && !isInt(ht) {
+				c.errf("E131", ex.High.Pos(), "slice high index must be int, got %s", ht.String())
+			}
+		}
+		if sl, ok := xt.(*Slice); ok {
+			if !IsCopy(sl.Elem) {
+				c.errf("E183", ex.At, "slicing requires Copy elements; deep copying %s is not supported", sl.Elem.String())
+			}
+			return sl
+		}
+		if p, ok := xt.(*Ptr); ok {
+			if sl, ok := p.Elem.(*Slice); ok {
+				if !IsCopy(sl.Elem) {
+					c.errf("E183", ex.At, "slicing requires Copy elements; deep copying %s is not supported", sl.Elem.String())
+				}
+				return sl
+			}
+		}
+		if b, ok := xt.(*Basic); ok && b.Name == "string" {
+			return String
+		}
+		c.errf("E132", ex.At, "type %s cannot be sliced", xt.String())
 		return nil
 	}
 	return nil
@@ -1001,6 +1226,10 @@ func isBuiltin(name string) bool {
 	return false
 }
 
+func IsPlace(e ast.Expr) bool {
+	return isPlace(e)
+}
+
 func isPlace(e ast.Expr) bool {
 	switch ex := e.(type) {
 	case *ast.Ident:
@@ -1009,6 +1238,10 @@ func isPlace(e ast.Expr) bool {
 		return isPlace(ex.X)
 	case *ast.Index:
 		return true
+	case *ast.Unary:
+		if ex.Op == "*" {
+			return true
+		}
 	}
 	return false
 }
@@ -1020,6 +1253,14 @@ func rootIdent(e ast.Expr) (string, bool) {
 	case *ast.Field:
 		return rootIdent(ex.X)
 	case *ast.Index:
+		return rootIdent(ex.X)
+	case *ast.SliceExpr:
+		return rootIdent(ex.X)
+	case *ast.Unary:
+		if ex.Op == "*" {
+			return rootIdent(ex.X)
+		}
+	case *ast.AddrOf:
 		return rootIdent(ex.X)
 	}
 	return "", false
@@ -1054,13 +1295,24 @@ func assignable(dst, src Type) bool {
 }
 
 func (c *checker) checkStatements(stmts []ast.Stmt) {
-	terminated := false
+	termReason := ""
 	for _, s := range stmts {
-		if terminated {
-			c.errf("E120", s.Pos(), "unreachable statement after return")
+		if termReason != "" {
+			c.errf("E120", s.Pos(), "unreachable statement after %s", termReason)
 			return
 		}
 		c.checkStmt(s)
-		terminated = ast.Terminates(s)
+		switch s.(type) {
+		case *ast.ReturnStmt:
+			termReason = "return"
+		case *ast.BreakStmt:
+			termReason = "break"
+		case *ast.ContinueStmt:
+			termReason = "continue"
+		default:
+			if ast.Terminates(s) {
+				termReason = "return"
+			}
+		}
 	}
 }

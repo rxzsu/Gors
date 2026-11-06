@@ -1,0 +1,31 @@
+fn main() {
+    let numbers = [10, 20, 30, 40]
+
+    println("Iterating numbers:")
+    for n in numbers {
+        println(n)
+    }
+
+    println("Iterating with index:")
+    for i, n in numbers {
+        println(i)
+        println(n)
+    }
+
+    let words = ["hello", "world", "gors"]
+    println("Iterating strings:")
+    for w in words {
+        println(w)
+    }
+
+    println("For loop with continue and break:")
+    for i, n in numbers {
+        if i == 0 {
+            continue
+        }
+        if n > 30 {
+            break
+        }
+        println(n)
+    }
+}

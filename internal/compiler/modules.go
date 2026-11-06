@@ -241,6 +241,23 @@ func (m *module) resolve() error {
 				for _, a := range e.Elems {
 					expr(a)
 				}
+			case *ast.MatchExpr:
+				expr(e.Value)
+				for _, a := range e.Arms {
+					scopes = append(scopes, map[string]bool{})
+					if a.Name != "" {
+						scopes[len(scopes)-1][a.Name] = true
+					}
+					if a.Body != nil {
+						for _, s := range a.Body.Stmts {
+							stmt(s)
+						}
+					}
+					if a.Expr != nil {
+						expr(a.Expr)
+					}
+					scopes = scopes[:len(scopes)-1]
+				}
 			}
 		}
 		block = func(b *ast.Block, binding string) {

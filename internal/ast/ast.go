@@ -103,6 +103,14 @@ type Index struct {
 	At  token.Pos
 }
 
+// SliceExpr is x[low:high].
+type SliceExpr struct {
+	X    Expr
+	Low  Expr // may be nil
+	High Expr // may be nil
+	At   token.Pos
+}
+
 // StructLit is Name{ field: value, ... }.
 type StructLit struct {
 	Type   string
@@ -145,6 +153,7 @@ func (e *Binary) expr()    {}
 func (e *Call) expr()      {}
 func (e *Field) expr()     {}
 func (e *Index) expr()     {}
+func (e *SliceExpr) expr() {}
 func (e *StructLit) expr() {}
 func (e *SliceLit) expr()  {}
 func (e *TryExpr) expr()   {}
@@ -160,6 +169,7 @@ func (e *Binary) Pos() token.Pos    { return e.At }
 func (e *Call) Pos() token.Pos      { return e.At }
 func (e *Field) Pos() token.Pos     { return e.At }
 func (e *Index) Pos() token.Pos     { return e.At }
+func (e *SliceExpr) Pos() token.Pos { return e.At }
 func (e *StructLit) Pos() token.Pos { return e.At }
 func (e *SliceLit) Pos() token.Pos  { return e.At }
 func (e *TryExpr) Pos() token.Pos   { return e.At }
@@ -212,10 +222,26 @@ type IfLetStmt struct {
 	At    token.Pos
 }
 
+type BreakStmt struct {
+	At token.Pos
+}
+
+type ContinueStmt struct {
+	At token.Pos
+}
+
 type WhileStmt struct {
 	Cond Expr
 	Body *Block
 	At   token.Pos
+}
+
+type ForStmt struct {
+	Key   string
+	Value string
+	Iter  Expr
+	Body  *Block
+	At    token.Pos
 }
 
 type Block struct {
@@ -229,7 +255,10 @@ func (s *ExprStmt) stmt()   {}
 func (s *ReturnStmt) stmt() {}
 func (s *IfStmt) stmt()     {}
 func (s *IfLetStmt) stmt()  {}
-func (s *WhileStmt) stmt()  {}
+func (s *WhileStmt) stmt()    {}
+func (s *ForStmt) stmt()      {}
+func (s *BreakStmt) stmt()    {}
+func (s *ContinueStmt) stmt() {}
 func (s *Block) stmt()      {}
 
 func (s *LetStmt) Pos() token.Pos    { return s.At }
@@ -238,7 +267,10 @@ func (s *ExprStmt) Pos() token.Pos   { return s.At }
 func (s *ReturnStmt) Pos() token.Pos { return s.At }
 func (s *IfStmt) Pos() token.Pos     { return s.At }
 func (s *IfLetStmt) Pos() token.Pos  { return s.At }
-func (s *WhileStmt) Pos() token.Pos  { return s.At }
+func (s *WhileStmt) Pos() token.Pos    { return s.At }
+func (s *ForStmt) Pos() token.Pos      { return s.At }
+func (s *BreakStmt) Pos() token.Pos    { return s.At }
+func (s *ContinueStmt) Pos() token.Pos { return s.At }
 func (s *Block) Pos() token.Pos      { return s.At }
 
 // Param is a function parameter.
@@ -298,11 +330,22 @@ type MatchStmt struct {
 type MatchArm struct {
 	Kind, Name string
 	Body       *Block
+	Expr       Expr
 	At         token.Pos
 }
 
 func (s *MatchStmt) stmt()          {}
 func (s *MatchStmt) Pos() token.Pos { return s.At }
+
+// MatchExpr exhaustively evaluates to a branch expression based on Option or Result.
+type MatchExpr struct {
+	Value Expr
+	Arms  []*MatchArm
+	At    token.Pos
+}
+
+func (e *MatchExpr) expr()          {}
+func (e *MatchExpr) Pos() token.Pos { return e.At }
 
 // Terminates reports whether every path through a statement returns.
 func Terminates(s Stmt) bool {

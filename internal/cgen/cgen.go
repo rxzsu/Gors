@@ -91,6 +91,24 @@ static inline void gors_bounds(int64_t i, int64_t n) {
 
 #define GORS_AT(s, i) (gors_bounds((i), (s).len), (s).data[(i)])
 
+static inline void gors_slice_bounds(int64_t low, int64_t high, int64_t len) {
+    if (low < 0 || high < low || high > len) {
+        fprintf(stderr, "gors: slice bounds out of range [%lld:%lld] (len %lld)\n",
+                (long long)low, (long long)high, (long long)len);
+        exit(1);
+    }
+}
+
+[[maybe_unused]] static gors_str gors_str_slice(gors_str s, int64_t low, int64_t high) {
+    int64_t len = (int64_t)strlen(s);
+    gors_slice_bounds(low, high, len);
+    int64_t n = high - low;
+    char* p = (char*)gors_malloc((size_t)n + 1);
+    memcpy(p, s + low, (size_t)n);
+    p[n] = '\0';
+    return p;
+}
+
 static void* gors_dup(const void* src, int64_t n, size_t elem) {
     size_t bytes = (size_t)n * elem;
     void* out = gors_malloc(bytes ? bytes : 1);
@@ -146,6 +164,8 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
 		if sl, ok := t.(*sema.Slice); ok {
 			g.line("[[maybe_unused]] static void %s_push(%s* s, %s v);",
 				sema.MonoName(sl), sema.MonoName(sl), cType(sl.Elem))
+			g.line("[[maybe_unused]] static %s %s_slice(%s s, int64_t low, int64_t high);",
+				sema.MonoName(sl), sema.MonoName(sl), sema.MonoName(sl))
 		}
 	}
 	g.out.WriteString("\n")
@@ -201,10 +221,11 @@ type gen struct {
 	ind     int
 	tmp     int
 
-	transfers [][]string
-	entry     bool
-	retType   sema.Type
-	scopes    []*scope
+	transfers  [][]string
+	entry      bool
+	retType    sema.Type
+	scopes     []*scope
+	loopScopes []int
 }
 
 func (g *gen) temp() string {
@@ -295,6 +316,23 @@ func (g *gen) dropScope() {
 		if v.owned {
 			g.emitDrop(v.name, v.typ)
 			v.owned = false
+		}
+	}
+}
+
+func (g *gen) dropToLoop() {
+	if len(g.loopScopes) == 0 {
+		return
+	}
+	targetScope := g.loopScopes[len(g.loopScopes)-1]
+	for i := len(g.scopes) - 1; i >= targetScope; i-- {
+		sc := g.scopes[i]
+		for j := len(sc.vars) - 1; j >= 0; j-- {
+			v := &sc.vars[j]
+			if v.owned {
+				g.emitDrop(v.name, v.typ)
+				v.owned = false
+			}
 		}
 	}
 }
@@ -531,6 +569,14 @@ func (g *gen) emitFieldDrop(expr string, t sema.Type) {
 func (g *gen) genSlicePush(sl *sema.Slice) {
 	name := sema.MonoName(sl)
 	elem := cType(sl.Elem)
+	g.line("[[maybe_unused]] static %s %s_slice(%s s, int64_t low, int64_t high) {", name, name, name)
+	g.ind++
+	g.line("gors_slice_bounds(low, high, s.len);")
+	g.line("int64_t n = high - low;")
+	g.line("if (n == 0) return (%s){0};", name)
+	g.line("return (%s){ .data = (%s*)gors_dup(s.data + low, n, sizeof(%s)), .len = n, .cap = n };", name, elem, elem)
+	g.ind--
+	g.line("}")
 	g.line("[[maybe_unused]] static void %s_push(%s* s, %s v) {", name, name, elem)
 	g.ind++
 	g.line("if (s->len == s->cap) {")
@@ -765,9 +811,92 @@ func (g *gen) genStmt(s ast.Stmt) {
 		g.ind--
 		g.ind++
 		g.pushScope()
+		g.loopScopes = append(g.loopScopes, len(g.scopes)-1)
 		for _, s := range st.Body.Stmts {
 			g.genStmt(s)
 		}
+		g.loopScopes = g.loopScopes[:len(g.loopScopes)-1]
+		if !blockTerminates(st.Body.Stmts) {
+			g.dropScope()
+		}
+		g.popScope()
+		g.ind--
+		g.line("}")
+
+	case *ast.BreakStmt:
+		snap := g.snapshotOwned()
+		g.dropToLoop()
+		g.restoreOwned(snap)
+		g.line("break;")
+
+	case *ast.ContinueStmt:
+		snap := g.snapshotOwned()
+		g.dropToLoop()
+		g.restoreOwned(snap)
+		g.line("continue;")
+
+	case *ast.ForStmt:
+		iterT := g.info.ExprTypes[st.Iter]
+		var sl *sema.Slice
+		if s, ok := iterT.(*sema.Slice); ok {
+			sl = s
+		} else if p, ok := iterT.(*sema.Ptr); ok {
+			if s, ok := p.Elem.(*sema.Slice); ok {
+				sl = s
+			}
+		}
+
+		g.line("{")
+		g.ind++
+		g.pushScope()
+
+		tmpPtr := g.temp()
+		if _, isRef := iterT.(*sema.Ptr); isRef {
+			iterVal := g.expr(st.Iter)
+			g.line("%s* %s = %s;", sema.MonoName(sl), tmpPtr, iterVal)
+		} else if sema.IsPlace(st.Iter) {
+			iterVal := g.rawExpr(st.Iter)
+			g.line("%s* %s = &%s;", sema.MonoName(sl), tmpPtr, iterVal)
+		} else {
+			iterVal := g.expr(st.Iter)
+			g.line("%s* %s = &%s;", sema.MonoName(sl), tmpPtr, iterVal)
+		}
+
+		tmpLen := g.temp()
+		g.line("int64_t %s = %s->len;", tmpLen, tmpPtr)
+
+		tmpIdx := g.temp()
+		g.line("for (int64_t %s = 0; %s < %s; %s++) {", tmpIdx, tmpIdx, tmpLen, tmpIdx)
+		g.ind++
+		g.pushScope()
+		g.loopScopes = append(g.loopScopes, len(g.scopes)-1)
+
+		if st.Key != "" && st.Key != "_" {
+			keyName := mangle(st.Key)
+			g.line("int64_t %s = %s;", keyName, tmpIdx)
+		}
+		if st.Value != "" && st.Value != "_" {
+			vt := g.info.ForTypes[st]
+			valName := mangle(st.Value)
+			if _, isRef := vt.(*sema.Ptr); isRef {
+				g.line("%s* %s = &%s->data[%s];", cType(sl.Elem), valName, tmpPtr, tmpIdx)
+			} else {
+				g.line("%s %s = %s->data[%s];", cType(sl.Elem), valName, tmpPtr, tmpIdx)
+			}
+		}
+
+		for _, s := range st.Body.Stmts {
+			g.genStmt(s)
+		}
+
+		g.loopScopes = g.loopScopes[:len(g.loopScopes)-1]
+		if !blockTerminates(st.Body.Stmts) {
+			g.dropScope()
+		}
+		g.popScope()
+		g.ind--
+		g.line("}")
+
 		g.dropScope()
 		g.popScope()
 		g.ind--
@@ -949,7 +1078,16 @@ func (g *gen) dropScopeIfOwned(name string, t sema.Type) {
 }
 
 // blockTerminates reports whether control always leaves the block via return.
-func blockTerminates(stmts []ast.Stmt) bool { return ast.Terminates(&ast.Block{Stmts: stmts}) }
+func blockTerminates(stmts []ast.Stmt) bool {
+	if len(stmts) == 0 {
+		return false
+	}
+	switch stmts[len(stmts)-1].(type) {
+	case *ast.ReturnStmt, *ast.BreakStmt, *ast.ContinueStmt:
+		return true
+	}
+	return ast.Terminates(&ast.Block{Stmts: stmts})
+}
 
 func (g *gen) genMatch(st *ast.MatchStmt) {
 	t := g.info.ExprTypes[st.Value]
@@ -1025,8 +1163,16 @@ func (g *gen) place(e ast.Expr) string {
 		base := g.place(ex.X)
 		idx := g.temp()
 		g.line("int64_t %s = %s;", idx, g.expr(ex.Idx))
-		g.line("gors_bounds(%s, (%s).len);", idx, base)
-		return "(" + base + ").data[" + idx + "]"
+		dot := "."
+		if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
+			dot = "->"
+		}
+		g.line("gors_bounds(%s, (%s)%slen);", idx, base, dot)
+		return "(" + base + ")" + dot + "data[" + idx + "]"
+	case *ast.Unary:
+		if ex.Op == "*" {
+			return "(*" + g.expr(ex.X) + ")"
+		}
 	}
 	return g.expr(e)
 }
@@ -1093,7 +1239,7 @@ func (g *gen) expr(e ast.Expr) string {
 	t := g.info.ExprTypes[e]
 	fresh := false
 	switch e.(type) {
-	case *ast.Ident, *ast.Field, *ast.Index:
+	case *ast.Ident, *ast.Field, *ast.Index, *ast.MatchExpr:
 		return value
 	case *ast.Call:
 		fresh = !g.isVoidCall(e)
@@ -1190,6 +1336,11 @@ func (g *gen) rawExpr(e ast.Expr) string {
 		if _, isSlice := g.info.ExprTypes[ex.X].(*sema.Slice); isSlice {
 			return "GORS_AT(" + g.expr(ex.X) + ", " + g.expr(ex.Idx) + ")"
 		}
+		if p, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
+			if _, isSlice := p.Elem.(*sema.Slice); isSlice {
+				return "GORS_AT((*" + g.expr(ex.X) + "), " + g.expr(ex.Idx) + ")"
+			}
+		}
 		return g.expr(ex.X) + "[" + g.expr(ex.Idx) + "]"
 
 	case *ast.StructLit:
@@ -1202,8 +1353,104 @@ func (g *gen) rawExpr(e ast.Expr) string {
 	case *ast.SliceLit:
 		return g.sliceLit(ex)
 
+	case *ast.SliceExpr:
+		xt := g.info.ExprTypes[ex.X]
+		var base string
+		var lenExpr string
+		isStr := false
+		var slName string
+
+		if p, ok := xt.(*sema.Ptr); ok {
+			base = "(*" + g.expr(ex.X) + ")"
+			sl := p.Elem.(*sema.Slice)
+			slName = sema.MonoName(sl)
+			lenExpr = base + ".len"
+		} else if sl, ok := xt.(*sema.Slice); ok {
+			base = g.expr(ex.X)
+			slName = sema.MonoName(sl)
+			lenExpr = base + ".len"
+		} else {
+			base = g.expr(ex.X)
+			isStr = true
+			lenExpr = "(int64_t)strlen(" + base + ")"
+		}
+
+		lowStr := "0LL"
+		if ex.Low != nil {
+			lowStr = g.expr(ex.Low)
+		}
+		highStr := lenExpr
+		if ex.High != nil {
+			highStr = g.expr(ex.High)
+		}
+
+		if isStr {
+			return fmt.Sprintf("gors_str_slice(%s, %s, %s)", base, lowStr, highStr)
+		}
+		return fmt.Sprintf("%s_slice(%s, %s, %s)", slName, base, lowStr, highStr)
+
 	case *ast.TryExpr:
 		return g.lowerTry(ex)
+
+	case *ast.MatchExpr:
+		retT := g.info.ExprTypes[ex]
+		resTmp := g.temp()
+		g.line("%s %s = {0};", cType(retT), resTmp)
+		t := g.info.ExprTypes[ex.Value]
+		valTmp := g.temp()
+		g.line("%s %s = %s;", cType(t), valTmp, g.take(ex.Value))
+		g.declareOwned(valTmp, t)
+		snap := g.snapshotOwned()
+		cond := valTmp + ".some"
+		if _, ok := t.(*sema.ResultT); ok {
+			cond = valTmp + ".ok"
+		}
+		if ex.Arms[0].Kind == "None" || ex.Arms[0].Kind == "Err" {
+			cond = "!" + cond
+		}
+		g.line("if (%s) {", cond)
+		for i, arm := range ex.Arms {
+			if i > 0 {
+				g.line("} else {")
+			}
+			g.restoreOwned(snap)
+			g.ind++
+			g.pushScope()
+			if bound := g.info.MatchTypes[arm]; bound != nil {
+				field := "val"
+				if arm.Kind == "Err" {
+					field = "err"
+				}
+				g.line("%s %s = %s.%s;", cType(bound), mangle(arm.Name), valTmp, field)
+				g.declareOwned(mangle(arm.Name), bound)
+			}
+			g.markMoved(valTmp)
+			if arm.Body != nil {
+				for _, s := range arm.Body.Stmts {
+					g.genStmt(s)
+				}
+			}
+			if arm.Expr != nil {
+				val := g.take(arm.Expr)
+				g.line("%s = %s;", resTmp, val)
+				if ownsValue(retT) {
+					g.markMoved(val)
+				}
+			}
+			if arm.Body == nil || !ast.Terminates(arm.Body) {
+				g.dropScope()
+			}
+			g.popScope()
+			g.ind--
+		}
+		g.line("}")
+		g.markMoved(valTmp)
+		if ownsValue(retT) {
+			g.declareOwned(resTmp, retT)
+			sc := g.scopes[len(g.scopes)-1]
+			sc.vars[len(sc.vars)-1].temporary = true
+		}
+		return resTmp
 
 	case *ast.Call:
 		return g.call(ex)

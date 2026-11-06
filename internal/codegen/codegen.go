@@ -33,6 +33,25 @@ func Generate(prog *ast.Program, info *sema.Info) (string, error) {
     return i
 }
 
+func __gors_slice_bounds(low, high, n int64) {
+    if low < 0 || high < low || high > n {
+        fmt.Fprintf(os.Stderr, "gors: slice bounds out of range [%d:%d] (len %d)\n", low, high, n)
+        os.Exit(1)
+    }
+}
+
+func __gors_slice[T any](xs []T, low, high int64) []T {
+    __gors_slice_bounds(low, high, int64(len(xs)))
+    out := make([]T, high-low)
+    copy(out, xs[low:high])
+    return out
+}
+
+func __gors_string_slice(s string, low, high int64) string {
+    __gors_slice_bounds(low, high, int64(len(s)))
+    return s[low:high]
+}
+
 `)
 	for _, sd := range prog.Structs {
 		g.genStruct(sd)
@@ -325,6 +344,71 @@ func (g *gen) genStmt(s ast.Stmt) {
 		g.ind--
 		g.line("}")
 
+	case *ast.BreakStmt:
+		g.line("break")
+
+	case *ast.ContinueStmt:
+		g.line("continue")
+
+	case *ast.ForStmt:
+		iterT := g.info.ExprTypes[st.Iter]
+		isRef := false
+		if _, ok := iterT.(*sema.Ptr); ok {
+			isRef = true
+		}
+
+		g.line("{")
+		g.ind++
+		g.push()
+
+		tmpPtr := g.temp()
+		if isRef {
+			g.line("%s := %s", tmpPtr, g.expr(st.Iter))
+		} else if sema.IsPlace(st.Iter) {
+			g.line("%s := &%s", tmpPtr, g.expr(st.Iter))
+		} else {
+			iterVal := g.expr(st.Iter)
+			g.line("%s := &%s", tmpPtr, iterVal)
+		}
+
+		tmpLen := g.temp()
+		g.line("%s := int64(len(*%s))", tmpLen, tmpPtr)
+
+		tmpIdx := g.temp()
+		g.line("for %s := int64(0); %s < %s; %s++ {", tmpIdx, tmpIdx, tmpLen, tmpIdx)
+		g.ind++
+		g.push()
+
+		if st.Key != "" && st.Key != "_" {
+			keyName := mangle(st.Key)
+			g.line("%s := %s", keyName, tmpIdx)
+			g.use(keyName)
+		}
+		if st.Value != "" && st.Value != "_" {
+			vt := g.info.ForTypes[st]
+			valName := mangle(st.Value)
+			if _, isRefVal := vt.(*sema.Ptr); isRefVal {
+				g.line("%s := &(*%s)[%s]", valName, tmpPtr, tmpIdx)
+			} else {
+				g.line("%s := (*%s)[%s]", valName, tmpPtr, tmpIdx)
+			}
+			g.use(valName)
+		}
+
+		for _, s := range st.Body.Stmts {
+			g.genStmt(s)
+		}
+
+		g.emitUnused()
+		g.pop()
+		g.ind--
+		g.line("}")
+
+		g.emitUnused()
+		g.pop()
+		g.ind--
+		g.line("}")
+
 	case *ast.Block:
 		g.line("{")
 		g.ind++
@@ -468,6 +552,54 @@ func (g *gen) rawExpr(e ast.Expr) string {
 		g.use(name)
 		return name
 
+	case *ast.MatchExpr:
+		retT := g.info.ExprTypes[ex]
+		tmp := g.temp()
+		g.line("var %s %s", tmp, goType(retT))
+		t := g.info.ExprTypes[ex.Value]
+		valTmp := g.temp()
+		g.line("var %s %s = %s", valTmp, goType(t), g.expr(ex.Value))
+		cond := valTmp + ".some"
+		if _, ok := t.(*sema.ResultT); ok {
+			cond = valTmp + ".ok"
+		}
+		if ex.Arms[0].Kind == "None" || ex.Arms[0].Kind == "Err" {
+			cond = "!" + cond
+		}
+		g.line("if %s {", cond)
+		for i, arm := range ex.Arms {
+			if i > 0 {
+				g.line("} else {")
+			}
+			g.ind++
+			g.push()
+			if g.info.MatchTypes[arm] != nil {
+				field := "val"
+				if arm.Kind == "Err" {
+					field = "err"
+				}
+				name := mangle(arm.Name)
+				if name == "_" {
+					g.line("_ = %s.%s", valTmp, field)
+				} else {
+					g.line("%s := %s.%s", name, valTmp, field)
+					g.line("_ = %s", name)
+				}
+			}
+			if arm.Body != nil {
+				for _, s := range arm.Body.Stmts {
+					g.genStmt(s)
+				}
+			}
+			if arm.Expr != nil {
+				g.line("%s = %s", tmp, g.expr(arm.Expr))
+			}
+			g.pop()
+			g.ind--
+		}
+		g.line("}")
+		return tmp
+
 	case *ast.Unary:
 		return "(" + ex.Op + g.expr(ex.X) + ")"
 
@@ -501,7 +633,37 @@ func (g *gen) rawExpr(e ast.Expr) string {
 
 	case *ast.Index:
 		base := g.expr(ex.X)
+		if _, isPtr := g.info.ExprTypes[ex.X].(*sema.Ptr); isPtr {
+			base = "(*" + base + ")"
+		}
 		return base + "[__gors_index(" + base + ", " + g.expr(ex.Idx) + ")]"
+
+	case *ast.SliceExpr:
+		xt := g.info.ExprTypes[ex.X]
+		var base string
+		if _, ok := xt.(*sema.Ptr); ok {
+			base = "(*" + g.expr(ex.X) + ")"
+		} else {
+			base = g.expr(ex.X)
+		}
+		// Capture the input before evaluating bounds, including calls that may
+		// mutate the original slice variable.
+		tmp := g.temp()
+		g.line("%s := %s", tmp, base)
+		base = tmp
+		lowStr := "int64(0)"
+		if ex.Low != nil {
+			lowStr = g.expr(ex.Low)
+		}
+		highStr := "int64(len(" + base + "))"
+		if ex.High != nil {
+			highStr = g.expr(ex.High)
+		}
+		helper := "__gors_slice"
+		if xt == sema.String {
+			helper = "__gors_string_slice"
+		}
+		return helper + "(" + base + ", " + lowStr + ", " + highStr + ")"
 
 	case *ast.StructLit:
 		var parts []string

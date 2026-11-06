@@ -110,11 +110,12 @@ func isMutRef(t Type) bool {
 
 // FuncSig is a function signature.
 type FuncSig struct {
-	Public bool
-	Decl   token.Pos
-	Name   string
-	Params []Type
-	Ret    Type
+	Public      bool
+	Decl        token.Pos
+	Name        string
+	Params      []Type
+	Ret         Type
+	ElidedParam int // index of input ref param providing return ref lifetime (-1 if none)
 }
 
 // Info is the result of semantic analysis.
@@ -132,4 +133,5 @@ type Info struct {
 	Moves     map[ast.Expr]bool
 	ExprTypes map[ast.Expr]Type
 	LetTypes  map[*ast.LetStmt]Type
+	ForTypes  map[*ast.ForStmt]Type
 }
